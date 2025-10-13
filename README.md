@@ -28,6 +28,10 @@ This tool helps Azure administrators monitor certificate health across their Fro
 - Authenticated Azure session (`Connect-AzAccount`)
 - Appropriate permissions to read Azure Front Door resources
 
+### Network Considerations
+
+**Proxy Support**: Usage with corporate proxies has not been thoroughly tested. The script makes direct TCP connections to retrieve certificate details for Classic Front Door profiles, which may not work through proxy servers. If you encounter connection issues in a corporate environment, try running the script from outside the corporate network or use a Standard/Premium Front Door profile which relies solely on Azure REST APIs.
+
 ## Installation
 
 1. Clone or download this repository:
