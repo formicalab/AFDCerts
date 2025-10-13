@@ -1,3 +1,85 @@
+<#
+.SYNOPSIS
+    Retrieves and analyzes SSL/TLS certificates for Azure Front Door profiles.
+
+.DESCRIPTION
+    This script monitors certificate health across Azure Front Door deployments by retrieving
+    certificate information from both Classic and Standard/Premium Front Door profiles.
+    It displays certificate expiration dates with visual warnings, shows provisioning and
+    validation states, and can export results to CSV for reporting.
+
+    The script supports both Azure-managed certificates and custom certificates from Key Vault,
+    providing detailed information including certificate subject, provisioning state,
+    validation state, and Key Vault details where applicable.
+
+.PARAMETER FrontDoorName
+    The name of the Front Door profile to inspect. Supports both Standard/Premium and Classic
+    Front Door profiles. The script will automatically detect the Front Door type.
+
+.PARAMETER ExportCsvPath
+    Optional path to export results as a CSV file. If specified, certificate details will be
+    exported to this location for reporting and analysis purposes.
+
+.PARAMETER ApiVersion
+    The API version to use for Front Door REST API calls. Default is '2024-02-01'.
+    Override this parameter if you need to use a different API version for compatibility.
+
+.PARAMETER WarningDays
+    Number of days before certificate expiration to show warning indicators. Default is 30 days.
+    Certificates expiring within this period will be highlighted with warning symbols.
+
+.INPUTS
+    None. This script does not accept pipeline input.
+
+.OUTPUTS
+    System.Object[]
+    The script outputs a formatted table showing certificate details and returns an array of
+    custom objects containing certificate information. If ExportCsvPath is specified,
+    results are also exported to a CSV file.
+
+.EXAMPLE
+    .\get-frontdoor-certs.ps1 -FrontDoorName "my-frontdoor-profile"
+    
+    Retrieves certificate information for the specified Front Door profile and displays
+    results in a formatted table with color-coded status indicators.
+
+.EXAMPLE
+    .\get-frontdoor-certs.ps1 -FrontDoorName "my-frontdoor-profile" -ExportCsvPath "C:\Reports\certificates.csv"
+    
+    Retrieves certificate information and exports the results to a CSV file for reporting.
+
+.EXAMPLE
+    .\get-frontdoor-certs.ps1 -FrontDoorName "my-frontdoor-profile" -WarningDays 60
+    
+    Retrieves certificate information with a custom warning period of 60 days instead of
+    the default 30 days.
+
+.EXAMPLE
+    .\get-frontdoor-certs.ps1 -FrontDoorName "my-frontdoor-profile" -ApiVersion "2023-05-01"
+    
+    Retrieves certificate information using a specific API version for compatibility.
+
+.NOTES   
+    Network Considerations:
+    - Usage with corporate proxies has not been thoroughly tested
+    - Direct TCP connections for Classic Front Door may not work through proxy servers
+    - If connection issues occur in corporate environments, try running from outside
+      the corporate network or use Standard/Premium Front Door profiles
+    
+    Authentication Requirements:
+    - Must be authenticated to Azure (Connect-AzAccount)
+    - Requires appropriate permissions to read Azure Front Door resources
+
+.LINK
+    https://github.com/formicalab/AFDCerts
+
+.LINK
+    https://docs.microsoft.com/en-us/azure/frontdoor/
+
+.LINK
+    https://docs.microsoft.com/en-us/powershell/azure/
+#>
+
 #Requires -PSEdition Core
 using module Az.Accounts
 
