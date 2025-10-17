@@ -177,31 +177,33 @@ function Get-DynamicColumnWidths {
     $availableWidth = $consoleWidth - 10
     
     # Define minimum widths for each column (must-have space)
+    # Priority: Subscription, FrontDoor, Domain, CertType, ExpirationDate, KVName
+    # Subject and KVSecret can be sacrificed for space
     $minWidths = @{
         Subscription = 20
         FrontDoor = 15
-        Domain = 20
+        Domain = 25
         CertType = 8
         ProvState = 10
         ValState = 10
-        Subject = 15
+        Subject = 10
         ExpirationDate = 18
-        KVName = 10
-        KVSecret = 10
+        KVName = 15
+        KVSecret = 8
     }
     
     # Define ideal widths (what we'd like if we have space)
     $idealWidths = @{
         Subscription = 28
-        FrontDoor = 25
-        Domain = 35
-        CertType = 10
+        FrontDoor = 26
+        Domain = 38
+        CertType = 11
         ProvState = 12
         ValState = 12
-        Subject = 30
+        Subject = 25
         ExpirationDate = 22
-        KVName = 18
-        KVSecret = 25
+        KVName = 22
+        KVSecret = 20
     }
     
     # Determine which columns to show based on mode
@@ -615,7 +617,6 @@ if ($allResults.Count -eq 0) {
     # Determine if we're in bulk mode (multiple subscriptions/FrontDoors)
     $isBulkMode = $PSCmdlet.ParameterSetName -eq 'BulkProcessing'
     $hasMultipleSubscriptions = ($allResults | Select-Object -ExpandProperty SubscriptionId -Unique).Count -gt 1
-    $hasMultipleFrontDoors = ($allResults | Select-Object -ExpandProperty FrontDoorName -Unique).Count -gt 1
     
     # Check if any result has ValidationState (Standard/Premium) or not (Classic)
     $hasValidationState = $allResults[0].PSObject.Properties.Name -contains 'ValidationState'
@@ -718,6 +719,3 @@ if ($allResults.Count -eq 0) {
         Write-Host "`nResults exported to: $ExportCsvPath" -ForegroundColor Green
     }
 }
-
-# Return results
-return $allResults
