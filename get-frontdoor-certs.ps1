@@ -155,6 +155,89 @@ function Get-TruncatedString {
     return $text.Substring(0, $maxLength - 3) + "..."
 }
 
+# Function to calculate dynamic column widths based on console width
+function Get-DynamicColumnWidths {
+    param(
+        [bool]$hasValidationState,
+        [bool]$isBulkMode,
+        [bool]$hasMultipleSubscriptions,
+        [int]$minWidth = 80
+    )
+    
+    # Get console width, default to 160 if unable to determine
+    try {
+        $consoleWidth = $Host.UI.RawUI.WindowSize.Width
+        if ($consoleWidth -lt $minWidth) { $consoleWidth = $minWidth }
+    }
+    catch {
+        $consoleWidth = 160
+    }
+    
+    # Calculate available width (subtract some for spacing and borders)
+    $availableWidth = $consoleWidth - 10
+    
+    # Define minimum widths for each column (must-have space)
+    $minWidths = @{
+        Subscription = 20
+        FrontDoor = 15
+        Domain = 20
+        CertType = 8
+        ProvState = 10
+        ValState = 10
+        Subject = 15
+        ExpirationDate = 18
+        KVName = 10
+        KVSecret = 10
+    }
+    
+    # Define ideal widths (what we'd like if we have space)
+    $idealWidths = @{
+        Subscription = 28
+        FrontDoor = 25
+        Domain = 35
+        CertType = 10
+        ProvState = 12
+        ValState = 12
+        Subject = 30
+        ExpirationDate = 22
+        KVName = 18
+        KVSecret = 25
+    }
+    
+    # Determine which columns to show based on mode
+    $columns = @('Subscription', 'FrontDoor', 'Domain', 'CertType', 'ProvState')
+    if ($hasValidationState) { $columns += 'ValState' }
+    $columns += @('Subject', 'ExpirationDate', 'KVName', 'KVSecret')
+    
+    # Calculate minimum required width
+    $minRequired = ($columns | ForEach-Object { $minWidths[$_] + 1 } | Measure-Object -Sum).Sum
+    
+    # If we have more space than minimum, distribute proportionally
+    if ($availableWidth -gt $minRequired) {
+        $extraSpace = $availableWidth - $minRequired
+        $totalIdealExtra = ($columns | ForEach-Object { $idealWidths[$_] - $minWidths[$_] } | Measure-Object -Sum).Sum
+        
+        $widths = @{}
+        foreach ($col in $columns) {
+            if ($totalIdealExtra -gt 0) {
+                $idealExtra = $idealWidths[$col] - $minWidths[$col]
+                $allocation = [Math]::Floor($extraSpace * ($idealExtra / $totalIdealExtra))
+                $widths[$col] = [Math]::Min($minWidths[$col] + $allocation, $idealWidths[$col])
+            } else {
+                $widths[$col] = $minWidths[$col]
+            }
+        }
+    } else {
+        # Use minimum widths if console is narrow
+        $widths = @{}
+        foreach ($col in $columns) {
+            $widths[$col] = $minWidths[$col]
+        }
+    }
+    
+    return $widths
+}
+
 # Function to format expiration date with status indicators
 function Get-FormattedExpirationDate {
     param(
@@ -537,201 +620,76 @@ if ($allResults.Count -eq 0) {
     # Check if any result has ValidationState (Standard/Premium) or not (Classic)
     $hasValidationState = $allResults[0].PSObject.Properties.Name -contains 'ValidationState'
     
-    # Define column widths
-    # In bulk mode, add subscription and front door name columns
-    if ($isBulkMode -and $hasMultipleSubscriptions) {
-        $colSub = 38
-        $colFD = 20
-        $colDomain = 30
-        $colCertType = 10
-        $colProvState = 12
-        $colValState = 12
-        $colSubject = 25
-        $colExpiry = 22
-        
-        if ($hasValidationState) {
-            Write-Host ("{0,-$colSub} {1,-$colFD} {2,-$colDomain} {3,-$colCertType} {4,-$colProvState} {5,-$colValState} {6,-$colSubject} {7,-$colExpiry} {8}" -f "Subscription", "FrontDoor", "Domain", "CertType", "ProvState", "ValState", "Subject", "ExpirationDate", "KVName") -ForegroundColor Cyan
-            Write-Host ("{0,-$colSub} {1,-$colFD} {2,-$colDomain} {3,-$colCertType} {4,-$colProvState} {5,-$colValState} {6,-$colSubject} {7,-$colExpiry} {8}" -f "------------", "---------", "------", "--------", "---------", "--------", "-------", "--------------", "------") -ForegroundColor Cyan
-        } else {
-            Write-Host ("{0,-$colSub} {1,-$colFD} {2,-$colDomain} {3,-$colCertType} {4,-$colProvState} {5,-$colSubject} {6,-$colExpiry} {7}" -f "Subscription", "FrontDoor", "Domain", "CertType", "ProvState", "Subject", "ExpirationDate", "KVName") -ForegroundColor Cyan
-            Write-Host ("{0,-$colSub} {1,-$colFD} {2,-$colDomain} {3,-$colCertType} {4,-$colProvState} {5,-$colSubject} {6,-$colExpiry} {7}" -f "------------", "---------", "------", "--------", "---------", "-------", "--------------", "------") -ForegroundColor Cyan
-        }
-    } elseif ($isBulkMode -and $hasMultipleFrontDoors) {
-        $colFD = 25
-        $colDomain = 35
-        $colCertType = 12
-        $colProvState = 12
-        $colValState = 14
-        $colSubject = 28
-        $colExpiry = 22
-        
-        if ($hasValidationState) {
-            Write-Host ("{0,-$colFD} {1,-$colDomain} {2,-$colCertType} {3,-$colProvState} {4,-$colValState} {5,-$colSubject} {6,-$colExpiry} {7}" -f "FrontDoor", "Domain", "CertType", "ProvState", "ValState", "Subject", "ExpirationDate", "KVName") -ForegroundColor Cyan
-            Write-Host ("{0,-$colFD} {1,-$colDomain} {2,-$colCertType} {3,-$colProvState} {4,-$colValState} {5,-$colSubject} {6,-$colExpiry} {7}" -f "---------", "------", "--------", "---------", "--------", "-------", "--------------", "------") -ForegroundColor Cyan
-        } else {
-            Write-Host ("{0,-$colFD} {1,-$colDomain} {2,-$colCertType} {3,-$colProvState} {4,-$colSubject} {5,-$colExpiry} {6}" -f "FrontDoor", "Domain", "CertType", "ProvState", "Subject", "ExpirationDate", "KVName") -ForegroundColor Cyan
-            Write-Host ("{0,-$colFD} {1,-$colDomain} {2,-$colCertType} {3,-$colProvState} {4,-$colSubject} {5,-$colExpiry} {6}" -f "---------", "------", "--------", "---------", "-------", "--------------", "------") -ForegroundColor Cyan
-        }
+    # Get dynamic column widths based on console size
+    $colWidths = Get-DynamicColumnWidths -hasValidationState $hasValidationState -isBulkMode $isBulkMode -hasMultipleSubscriptions $hasMultipleSubscriptions
+    
+    $colSub = $colWidths['Subscription']
+    $colFD = $colWidths['FrontDoor']
+    $colDomain = $colWidths['Domain']
+    $colCertType = $colWidths['CertType']
+    $colProvState = $colWidths['ProvState']
+    $colValState = if ($hasValidationState) { $colWidths['ValState'] } else { 0 }
+    $colSubject = $colWidths['Subject']
+    $colExpiry = $colWidths['ExpirationDate']
+    $colKVName = $colWidths['KVName']
+    $colKVSecret = $colWidths['KVSecret']
+    
+    # Display header
+    if ($hasValidationState) {
+        Write-Host ("{0,-$colSub} {1,-$colFD} {2,-$colDomain} {3,-$colCertType} {4,-$colProvState} {5,-$colValState} {6,-$colSubject} {7,-$colExpiry} {8,-$colKVName} {9}" -f "Subscription", "FrontDoor", "Domain", "CertType", "ProvState", "ValState", "Subject", "ExpirationDate", "KVName", "KVSecret") -ForegroundColor Cyan
+        Write-Host ("{0,-$colSub} {1,-$colFD} {2,-$colDomain} {3,-$colCertType} {4,-$colProvState} {5,-$colValState} {6,-$colSubject} {7,-$colExpiry} {8,-$colKVName} {9}" -f "------------", "---------", "------", "--------", "---------", "--------", "-------", "--------------", "------", "--------") -ForegroundColor Cyan
     } else {
-        # Single mode or single FrontDoor - show subscription and frontdoor name
-        if ($hasValidationState) {
-            $colSub = 28
-            $colFD = 25
-            $colDomain = 30
-            $colCertType = 10
-            $colProvState = 12
-            $colValState = 12
-            $colSubject = 25
-            $colExpiry = 22
-            $colKVName = 18
-            
-            Write-Host ("{0,-$colSub} {1,-$colFD} {2,-$colDomain} {3,-$colCertType} {4,-$colProvState} {5,-$colValState} {6,-$colSubject} {7,-$colExpiry} {8,-$colKVName} {9}" -f "Subscription", "FrontDoor", "Domain", "CertType", "ProvState", "ValState", "Subject", "ExpirationDate", "KVName", "KVSecret") -ForegroundColor Cyan
-            Write-Host ("{0,-$colSub} {1,-$colFD} {2,-$colDomain} {3,-$colCertType} {4,-$colProvState} {5,-$colValState} {6,-$colSubject} {7,-$colExpiry} {8,-$colKVName} {9}" -f "------------", "---------", "------", "--------", "---------", "--------", "-------", "--------------", "------", "--------") -ForegroundColor Cyan
-        } else {
-            $colSub = 28
-            $colFD = 25
-            $colDomain = 30
-            $colCertType = 10
-            $colProvState = 12
-            $colSubject = 30
-            $colExpiry = 22
-            $colKVName = 18
-            
-            Write-Host ("{0,-$colSub} {1,-$colFD} {2,-$colDomain} {3,-$colCertType} {4,-$colProvState} {5,-$colSubject} {6,-$colExpiry} {7,-$colKVName} {8}" -f "Subscription", "FrontDoor", "Domain", "CertType", "ProvState", "Subject", "ExpirationDate", "KVName", "KVSecret") -ForegroundColor Cyan
-            Write-Host ("{0,-$colSub} {1,-$colFD} {2,-$colDomain} {3,-$colCertType} {4,-$colProvState} {5,-$colSubject} {6,-$colExpiry} {7,-$colKVName} {8}" -f "------------", "---------", "------", "--------", "---------", "-------", "--------------", "------", "--------") -ForegroundColor Cyan
-        }
+        Write-Host ("{0,-$colSub} {1,-$colFD} {2,-$colDomain} {3,-$colCertType} {4,-$colProvState} {5,-$colSubject} {6,-$colExpiry} {7,-$colKVName} {8}" -f "Subscription", "FrontDoor", "Domain", "CertType", "ProvState", "Subject", "ExpirationDate", "KVName", "KVSecret") -ForegroundColor Cyan
+        Write-Host ("{0,-$colSub} {1,-$colFD} {2,-$colDomain} {3,-$colCertType} {4,-$colProvState} {5,-$colSubject} {6,-$colExpiry} {7,-$colKVName} {8}" -f "------------", "---------", "------", "--------", "---------", "-------", "--------------", "------", "--------") -ForegroundColor Cyan
     }
     
     # Display results with color coding and truncation
     foreach ($result in $allResults) {
-        # Determine what columns to show based on mode
-        if ($isBulkMode -and $hasMultipleSubscriptions) {
-            $dispSub = Get-TruncatedString $result.SubscriptionName ($colSub - 1)
-            $dispFD = Get-TruncatedString $result.FrontDoorName ($colFD - 1)
-            $dispDomain = Get-TruncatedString $result.Domain ($colDomain - 1)
-            $dispCertType = Get-TruncatedString $result.CertificateType ($colCertType - 1)
-            $dispProvState = Get-TruncatedString $result.ProvisioningState ($colProvState - 1)
-            $dispSubject = Get-TruncatedString $result.Subject ($colSubject - 1)
-            $dispExpiry = Get-TruncatedString $result.ExpirationDate ($colExpiry - 1)
-            $dispKVName = Get-TruncatedString $result.KeyVaultName 20
-            
-            Write-Host ("{0,-$colSub} {1,-$colFD} {2,-$colDomain} {3,-$colCertType}" -f $dispSub, $dispFD, $dispDomain, $dispCertType) -NoNewline
-            
-            # Provisioning State with color
-            if ($result.ProvisioningState -and $result.ProvisioningState -notlike '*Succeeded*' -and $result.ProvisioningState -notlike '*Enabled*') {
-                Write-Host ("{0,-$colProvState}" -f $dispProvState) -NoNewline -ForegroundColor Yellow
-            } else {
-                Write-Host ("{0,-$colProvState}" -f $dispProvState) -NoNewline
-            }
-            
-            # Validation State with color (only for Standard/Premium)
-            if ($hasValidationState) {
-                $dispValState = Get-TruncatedString $result.ValidationState ($colValState - 1)
-                if ($result.ValidationState -and $result.ValidationState -notlike '*Approved*') {
-                    Write-Host ("{0,-$colValState}" -f $dispValState) -NoNewline -ForegroundColor Yellow
-                } else {
-                    Write-Host ("{0,-$colValState}" -f $dispValState) -NoNewline
-                }
-            }
-            
-            Write-Host ("{0,-$colSubject}" -f $dispSubject) -NoNewline
-            
-            # Expiration Date with color
-            if ($result.ExpirationStatus -eq 'EXPIRED') {
-                Write-Host ("{0,-$colExpiry}" -f $dispExpiry) -NoNewline -ForegroundColor Red
-            } elseif ($result.ExpirationStatus -eq 'WARNING') {
-                Write-Host ("{0,-$colExpiry}" -f $dispExpiry) -NoNewline -ForegroundColor Yellow
-            } else {
-                Write-Host ("{0,-$colExpiry}" -f $dispExpiry) -NoNewline
-            }
-            
-            Write-Host ("{0}" -f $dispKVName)
-            
-        } elseif ($isBulkMode -and $hasMultipleFrontDoors) {
-            $dispFD = Get-TruncatedString $result.FrontDoorName ($colFD - 1)
-            $dispDomain = Get-TruncatedString $result.Domain ($colDomain - 1)
-            $dispCertType = Get-TruncatedString $result.CertificateType ($colCertType - 1)
-            $dispProvState = Get-TruncatedString $result.ProvisioningState ($colProvState - 1)
-            $dispSubject = Get-TruncatedString $result.Subject ($colSubject - 1)
-            $dispExpiry = Get-TruncatedString $result.ExpirationDate ($colExpiry - 1)
-            $dispKVName = Get-TruncatedString $result.KeyVaultName 20
-            
-            Write-Host ("{0,-$colFD} {1,-$colDomain} {2,-$colCertType}" -f $dispFD, $dispDomain, $dispCertType) -NoNewline
-            
-            # Provisioning State with color
-            if ($result.ProvisioningState -and $result.ProvisioningState -notlike '*Succeeded*' -and $result.ProvisioningState -notlike '*Enabled*') {
-                Write-Host ("{0,-$colProvState}" -f $dispProvState) -NoNewline -ForegroundColor Yellow
-            } else {
-                Write-Host ("{0,-$colProvState}" -f $dispProvState) -NoNewline
-            }
-            
-            # Validation State with color (only for Standard/Premium)
-            if ($hasValidationState) {
-                $dispValState = Get-TruncatedString $result.ValidationState ($colValState - 1)
-                if ($result.ValidationState -and $result.ValidationState -notlike '*Approved*') {
-                    Write-Host ("{0,-$colValState}" -f $dispValState) -NoNewline -ForegroundColor Yellow
-                } else {
-                    Write-Host ("{0,-$colValState}" -f $dispValState) -NoNewline
-                }
-            }
-            
-            Write-Host ("{0,-$colSubject}" -f $dispSubject) -NoNewline
-            
-            # Expiration Date with color
-            if ($result.ExpirationStatus -eq 'EXPIRED') {
-                Write-Host ("{0,-$colExpiry}" -f $dispExpiry) -NoNewline -ForegroundColor Red
-            } elseif ($result.ExpirationStatus -eq 'WARNING') {
-                Write-Host ("{0,-$colExpiry}" -f $dispExpiry) -NoNewline -ForegroundColor Yellow
-            } else {
-                Write-Host ("{0,-$colExpiry}" -f $dispExpiry) -NoNewline
-            }
-            
-            Write-Host ("{0}" -f $dispKVName)
-            
+        # Truncate all fields for display
+        $dispSub = Get-TruncatedString $result.SubscriptionName ($colSub - 1)
+        $dispFD = Get-TruncatedString $result.FrontDoorName ($colFD - 1)
+        $dispDomain = Get-TruncatedString $result.Domain ($colDomain - 1)
+        $dispCertType = Get-TruncatedString $result.CertificateType ($colCertType - 1)
+        $dispProvState = Get-TruncatedString $result.ProvisioningState ($colProvState - 1)
+        $dispSubject = Get-TruncatedString $result.Subject ($colSubject - 1)
+        $dispExpiry = Get-TruncatedString $result.ExpirationDate ($colExpiry - 1)
+        $dispKVName = Get-TruncatedString $result.KeyVaultName ($colKVName - 1)
+        $dispKVSecret = Get-TruncatedString $result.KeyVaultSecretName ($colKVSecret - 1)
+        
+        # Display subscription, frontdoor, domain, and cert type
+        Write-Host ("{0,-$colSub} {1,-$colFD} {2,-$colDomain} {3,-$colCertType}" -f $dispSub, $dispFD, $dispDomain, $dispCertType) -NoNewline
+        
+        # Provisioning State with color
+        if ($result.ProvisioningState -and $result.ProvisioningState -notlike '*Succeeded*' -and $result.ProvisioningState -notlike '*Enabled*') {
+            Write-Host ("{0,-$colProvState}" -f $dispProvState) -NoNewline -ForegroundColor Yellow
         } else {
-            # Single mode display - with subscription and frontdoor columns
-            $dispSub = Get-TruncatedString $result.SubscriptionName ($colSub - 1)
-            $dispFD = Get-TruncatedString $result.FrontDoorName ($colFD - 1)
-            $dispDomain = Get-TruncatedString $result.Domain ($colDomain - 1)
-            $dispCertType = Get-TruncatedString $result.CertificateType ($colCertType - 1)
-            $dispProvState = Get-TruncatedString $result.ProvisioningState ($colProvState - 1)
-            $dispSubject = Get-TruncatedString $result.Subject ($colSubject - 1)
-            $dispExpiry = Get-TruncatedString $result.ExpirationDate ($colExpiry - 1)
-            $dispKVName = Get-TruncatedString $result.KeyVaultName ($colKVName - 1)
-            $dispKVSecret = Get-TruncatedString $result.KeyVaultSecretName 32
-            
-            Write-Host ("{0,-$colSub} {1,-$colFD} {2,-$colDomain} {3,-$colCertType}" -f $dispSub, $dispFD, $dispDomain, $dispCertType) -NoNewline
-            
-            # Provisioning State with color
-            if ($result.ProvisioningState -and $result.ProvisioningState -notlike '*Succeeded*' -and $result.ProvisioningState -notlike '*Enabled*') {
-                Write-Host ("{0,-$colProvState}" -f $dispProvState) -NoNewline -ForegroundColor Yellow
-            } else {
-                Write-Host ("{0,-$colProvState}" -f $dispProvState) -NoNewline
-            }
-            
-            # Validation State with color (only for Standard/Premium)
-            if ($hasValidationState) {
-                $dispValState = Get-TruncatedString $result.ValidationState ($colValState - 1)
-                if ($result.ValidationState -and $result.ValidationState -notlike '*Approved*') {
-                    Write-Host ("{0,-$colValState}" -f $dispValState) -NoNewline -ForegroundColor Yellow
-                } else {
-                    Write-Host ("{0,-$colValState}" -f $dispValState) -NoNewline
-                }
-            }
-            
-            Write-Host ("{0,-$colSubject}" -f $dispSubject) -NoNewline
-            
-            # Expiration Date with color
-            if ($result.ExpirationStatus -eq 'EXPIRED') {
-                Write-Host ("{0,-$colExpiry}" -f $dispExpiry) -NoNewline -ForegroundColor Red
-            } elseif ($result.ExpirationStatus -eq 'WARNING') {
-                Write-Host ("{0,-$colExpiry}" -f $dispExpiry) -NoNewline -ForegroundColor Yellow
-            } else {
-                Write-Host ("{0,-$colExpiry}" -f $dispExpiry) -NoNewline
-            }
-            
-            Write-Host ("{0,-$colKVName} {1}" -f $dispKVName, $dispKVSecret)
+            Write-Host ("{0,-$colProvState}" -f $dispProvState) -NoNewline
         }
+        
+        # Validation State with color (only for Standard/Premium)
+        if ($hasValidationState) {
+            $dispValState = Get-TruncatedString $result.ValidationState ($colValState - 1)
+            if ($result.ValidationState -and $result.ValidationState -notlike '*Approved*') {
+                Write-Host ("{0,-$colValState}" -f $dispValState) -NoNewline -ForegroundColor Yellow
+            } else {
+                Write-Host ("{0,-$colValState}" -f $dispValState) -NoNewline
+            }
+        }
+        
+        # Subject
+        Write-Host ("{0,-$colSubject}" -f $dispSubject) -NoNewline
+        
+        # Expiration Date with color
+        if ($result.ExpirationStatus -eq 'EXPIRED') {
+            Write-Host ("{0,-$colExpiry}" -f $dispExpiry) -NoNewline -ForegroundColor Red
+        } elseif ($result.ExpirationStatus -eq 'WARNING') {
+            Write-Host ("{0,-$colExpiry}" -f $dispExpiry) -NoNewline -ForegroundColor Yellow
+        } else {
+            Write-Host ("{0,-$colExpiry}" -f $dispExpiry) -NoNewline
+        }
+        
+        # Key Vault details
+        Write-Host ("{0,-$colKVName} {1}" -f $dispKVName, $dispKVSecret)
     }
     
     Write-Host ""
