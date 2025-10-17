@@ -526,7 +526,6 @@ if ($PSCmdlet.ParameterSetName -eq 'SingleFrontDoor') {
 if ($allResults.Count -eq 0) {
     Write-Host "No certificate information found." -ForegroundColor Yellow
 } else {
-} else {
     Write-Host "`n=== Certificate Details ===" -ForegroundColor Green
     Write-Host ""
     
