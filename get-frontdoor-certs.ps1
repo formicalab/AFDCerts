@@ -573,28 +573,32 @@ if ($allResults.Count -eq 0) {
             Write-Host ("{0,-$colFD} {1,-$colDomain} {2,-$colCertType} {3,-$colProvState} {4,-$colSubject} {5,-$colExpiry} {6}" -f "---------", "------", "--------", "---------", "-------", "--------------", "------") -ForegroundColor Cyan
         }
     } else {
-        # Single mode or single FrontDoor - original column layout
+        # Single mode or single FrontDoor - show subscription and frontdoor name
         if ($hasValidationState) {
-            $colDomain = 42
-            $colCertType = 14
-            $colProvState = 14
-            $colValState = 17
-            $colSubject = 30
-            $colExpiry = 24
-            $colKVName = 20
+            $colSub = 28
+            $colFD = 25
+            $colDomain = 30
+            $colCertType = 10
+            $colProvState = 12
+            $colValState = 12
+            $colSubject = 25
+            $colExpiry = 22
+            $colKVName = 18
             
-            Write-Host ("{0,-$colDomain} {1,-$colCertType} {2,-$colProvState} {3,-$colValState} {4,-$colSubject} {5,-$colExpiry} {6,-$colKVName} {7}" -f "Domain", "CertType", "ProvState", "ValState", "Subject", "ExpirationDate", "KVName", "KVSecret") -ForegroundColor Cyan
-            Write-Host ("{0,-$colDomain} {1,-$colCertType} {2,-$colProvState} {3,-$colValState} {4,-$colSubject} {5,-$colExpiry} {6,-$colKVName} {7}" -f "------", "--------", "---------", "--------", "-------", "--------------", "------", "--------") -ForegroundColor Cyan
+            Write-Host ("{0,-$colSub} {1,-$colFD} {2,-$colDomain} {3,-$colCertType} {4,-$colProvState} {5,-$colValState} {6,-$colSubject} {7,-$colExpiry} {8,-$colKVName} {9}" -f "Subscription", "FrontDoor", "Domain", "CertType", "ProvState", "ValState", "Subject", "ExpirationDate", "KVName", "KVSecret") -ForegroundColor Cyan
+            Write-Host ("{0,-$colSub} {1,-$colFD} {2,-$colDomain} {3,-$colCertType} {4,-$colProvState} {5,-$colValState} {6,-$colSubject} {7,-$colExpiry} {8,-$colKVName} {9}" -f "------------", "---------", "------", "--------", "---------", "--------", "-------", "--------------", "------", "--------") -ForegroundColor Cyan
         } else {
-            $colDomain = 42
-            $colCertType = 14
-            $colProvState = 14
-            $colSubject = 40
-            $colExpiry = 24
-            $colKVName = 20
+            $colSub = 28
+            $colFD = 25
+            $colDomain = 30
+            $colCertType = 10
+            $colProvState = 12
+            $colSubject = 30
+            $colExpiry = 22
+            $colKVName = 18
             
-            Write-Host ("{0,-$colDomain} {1,-$colCertType} {2,-$colProvState} {3,-$colSubject} {4,-$colExpiry} {5,-$colKVName} {6}" -f "Domain", "CertType", "ProvState", "Subject", "ExpirationDate", "KVName", "KVSecret") -ForegroundColor Cyan
-            Write-Host ("{0,-$colDomain} {1,-$colCertType} {2,-$colProvState} {3,-$colSubject} {4,-$colExpiry} {5,-$colKVName} {6}" -f "------", "--------", "---------", "-------", "--------------", "------", "--------") -ForegroundColor Cyan
+            Write-Host ("{0,-$colSub} {1,-$colFD} {2,-$colDomain} {3,-$colCertType} {4,-$colProvState} {5,-$colSubject} {6,-$colExpiry} {7,-$colKVName} {8}" -f "Subscription", "FrontDoor", "Domain", "CertType", "ProvState", "Subject", "ExpirationDate", "KVName", "KVSecret") -ForegroundColor Cyan
+            Write-Host ("{0,-$colSub} {1,-$colFD} {2,-$colDomain} {3,-$colCertType} {4,-$colProvState} {5,-$colSubject} {6,-$colExpiry} {7,-$colKVName} {8}" -f "------------", "---------", "------", "--------", "---------", "-------", "--------------", "------", "--------") -ForegroundColor Cyan
         }
     }
     
@@ -685,7 +689,9 @@ if ($allResults.Count -eq 0) {
             Write-Host ("{0}" -f $dispKVName)
             
         } else {
-            # Single mode display - original layout
+            # Single mode display - with subscription and frontdoor columns
+            $dispSub = Get-TruncatedString $result.SubscriptionName ($colSub - 1)
+            $dispFD = Get-TruncatedString $result.FrontDoorName ($colFD - 1)
             $dispDomain = Get-TruncatedString $result.Domain ($colDomain - 1)
             $dispCertType = Get-TruncatedString $result.CertificateType ($colCertType - 1)
             $dispProvState = Get-TruncatedString $result.ProvisioningState ($colProvState - 1)
@@ -694,7 +700,7 @@ if ($allResults.Count -eq 0) {
             $dispKVName = Get-TruncatedString $result.KeyVaultName ($colKVName - 1)
             $dispKVSecret = Get-TruncatedString $result.KeyVaultSecretName 32
             
-            Write-Host ("{0,-$colDomain} {1,-$colCertType}" -f $dispDomain, $dispCertType) -NoNewline
+            Write-Host ("{0,-$colSub} {1,-$colFD} {2,-$colDomain} {3,-$colCertType}" -f $dispSub, $dispFD, $dispDomain, $dispCertType) -NoNewline
             
             # Provisioning State with color
             if ($result.ProvisioningState -and $result.ProvisioningState -notlike '*Succeeded*' -and $result.ProvisioningState -notlike '*Enabled*') {
@@ -705,7 +711,7 @@ if ($allResults.Count -eq 0) {
             
             # Validation State with color (only for Standard/Premium)
             if ($hasValidationState) {
-                $dispValState = Get-TruncatedString $result.ValidationState $colValState
+                $dispValState = Get-TruncatedString $result.ValidationState ($colValState - 1)
                 if ($result.ValidationState -and $result.ValidationState -notlike '*Approved*') {
                     Write-Host ("{0,-$colValState}" -f $dispValState) -NoNewline -ForegroundColor Yellow
                 } else {
