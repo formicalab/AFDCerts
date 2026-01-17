@@ -94,3 +94,21 @@ FrontDoorType only applies to -ScanSubscription and -ScanTenant modes
 
 - **Console**: Dynamic table with Subscription, FrontDoor, FDType, Domain, CertType, ProvState, ValState, Subject, ExpirationDate, KVName, KVSecret. Status indicators: 🔴 expired | ⚠️ warning | ✅ healthy
 - **CSV**: Clean data without emojis, suitable for Excel
+
+## Proxy Support
+
+The script automatically detects and uses system proxy settings:
+
+- **Detection methods**: Windows Internet Options, `HTTP_PROXY`/`HTTPS_PROXY` environment variables
+- **Classic Front Door**: Uses HTTP CONNECT tunnel through the proxy for TLS certificate fetching
+- **Standard/Premium Front Door**: Uses Azure REST API which respects proxy via the Az module
+
+At startup, the script displays:
+- `Proxy detected: http://proxy:port/` - when a proxy is configured
+- `No proxy detected - using direct connections` - when no proxy is found
+
+To configure a proxy via environment variables:
+```powershell
+$env:HTTPS_PROXY = "http://proxy.example.com:3128"
+$env:HTTP_PROXY = "http://proxy.example.com:3128"
+```

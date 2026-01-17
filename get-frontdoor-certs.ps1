@@ -99,10 +99,11 @@
 
 .NOTES   
     Network Considerations:
-    - Usage with corporate proxies has not been thoroughly tested
-    - Direct TCP connections for Classic Front Door may not work through proxy servers
-    - If connection issues occur in corporate environments, try running from outside
-      the corporate network or use Standard/Premium Front Door profiles
+    - For Classic Front Door, the script uses TcpClient + SslStream to fetch certificates
+    - System proxy is automatically detected via WebRequest.GetSystemWebProxy()
+    - When a proxy is configured, HTTP CONNECT tunnel is used for the TLS handshake
+    - Standard/Premium Front Door certificate info is retrieved via Azure REST API,
+      which also respects system proxy settings through the Az module
     
     Authentication Requirements:
     - Must be authenticated to Azure (Connect-AzAccount)
@@ -162,6 +163,19 @@ $ErrorActionPreference = 'Stop'
 # API version constant
 $script:ApiVersion = '2025-04-15'
 
+# Check for system proxy configuration once at startup
+$script:ProxyUri = $null
+$proxyTestUri = [Uri]"https://azure.microsoft.com"
+$systemProxy = [System.Net.WebRequest]::GetSystemWebProxy()
+$detectedProxy = $systemProxy.GetProxy($proxyTestUri)
+if ($detectedProxy -and $detectedProxy.Host -ne $proxyTestUri.Host) {
+    $script:ProxyUri = $detectedProxy
+    Write-Host "Proxy detected: $detectedProxy" -ForegroundColor Cyan
+    Write-Host "  Classic Front Door certificate fetching will use HTTP CONNECT tunnel" -ForegroundColor Gray
+} else {
+    Write-Host "No proxy detected - using direct connections" -ForegroundColor Gray
+}
+
 # Verify Azure login
 $context = Get-AzContext
 if (-not $context) {
@@ -170,6 +184,79 @@ if (-not $context) {
 
 # Global results collection (using List for better append performance)
 $allResults = [System.Collections.Generic.List[PSCustomObject]]::new()
+
+#region Certificate fetching for Classic Front Door
+
+# Helper function to get certificate from a domain using TcpClient + SslStream
+# Uses $script:ProxyUri detected at startup for HTTP CONNECT tunnel
+function Get-CertificateFromDomain {
+    param([string]$DomainName)
+    
+    $tcpClient = $null
+    $sslStream = $null
+    $networkStream = $null
+    
+    try {
+        $tcpClient = [System.Net.Sockets.TcpClient]::new()
+        
+        if ($script:ProxyUri) {
+            # Connect to proxy server
+            $tcpClient.Connect($script:ProxyUri.Host, $script:ProxyUri.Port)
+            $networkStream = $tcpClient.GetStream()
+            
+            # Send HTTP CONNECT request to establish tunnel
+            $writer = [System.IO.StreamWriter]::new($networkStream, [System.Text.Encoding]::ASCII)
+            $writer.AutoFlush = $true
+            $reader = [System.IO.StreamReader]::new($networkStream, [System.Text.Encoding]::ASCII)
+            
+            $writer.WriteLine("CONNECT ${DomainName}:443 HTTP/1.1")
+            $writer.WriteLine("Host: ${DomainName}:443")
+            $writer.WriteLine("")
+            
+            # Read proxy response
+            $response = $reader.ReadLine()
+            if ($response -notmatch "^HTTP/\d\.\d 200") {
+                throw "Proxy CONNECT failed: $response"
+            }
+            
+            # Read and discard remaining headers until empty line
+            while ($true) {
+                $line = $reader.ReadLine()
+                if ([string]::IsNullOrEmpty($line)) { break }
+            }
+            
+            # Now the tunnel is established, perform TLS handshake through it
+            $sslStream = [System.Net.Security.SslStream]::new(
+                $networkStream,
+                $false,
+                { param($s, $certificate, $chain, $sslPolicyErrors) return $true }
+            )
+        } else {
+            # Direct connection (no proxy)
+            $tcpClient.Connect($DomainName, 443)
+            
+            $sslStream = [System.Net.Security.SslStream]::new(
+                $tcpClient.GetStream(),
+                $false,
+                { param($s, $certificate, $chain, $sslPolicyErrors) return $true }
+            )
+        }
+        
+        $sslStream.AuthenticateAsClient($DomainName)
+        $cert = $sslStream.RemoteCertificate
+        
+        if ($cert) {
+            return [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($cert)
+        }
+        return $null
+    }
+    finally {
+        if ($sslStream) { $sslStream.Dispose() }
+        if ($tcpClient) { $tcpClient.Dispose() }
+    }
+}
+
+#endregion
 
 #region Get-TruncatedString
 
@@ -320,7 +407,6 @@ function Get-AllFrontDoorsInSubscription {
     )
     
     $frontDoors = @()
-    $context = Get-AzContext
     
     Write-Host "  Discovering Front Door profiles..." -ForegroundColor Cyan
     if ($TypeFilter -ne 'All') {
@@ -335,10 +421,10 @@ function Get-AllFrontDoorsInSubscription {
                 $_.Sku.Name -eq 'Standard_AzureFrontDoor' -or $_.Sku.Name -eq 'Premium_AzureFrontDoor'
             }
             
-            foreach ($profile in $afdProfiles) {
+            foreach ($afdProfile in $afdProfiles) {
                 $frontDoors += [PSCustomObject]@{
-                    Name = $profile.Name
-                    ResourceGroupName = $profile.ResourceGroupName
+                    Name = $afdProfile.Name
+                    ResourceGroupName = $afdProfile.ResourceGroupName
                     Type = 'Standard/Premium'
                 }
             }
@@ -552,41 +638,22 @@ function Get-FrontDoorCertificates {
                     $keyVaultName = ($ep.Vault -split '/')[-1]
                 }
                 
-                # Perform TLS connection to get certificate details
-                $tcpClient = $null
-                $sslStream = $null
+                # Fetch certificate from domain using TcpClient + SslStream
+                # Uses proxy if detected at startup ($script:ProxyUri)
                 try {
-                    $tcpClient = New-Object System.Net.Sockets.TcpClient
-                    $tcpClient.Connect($domainName, 443)
-                    
-                    $sslStream = New-Object System.Net.Security.SslStream(
-                        $tcpClient.GetStream(),
-                        $false,
-                        { param($s, $certificate, $chain, $sslPolicyErrors) return $true }
-                    )
-                    
-                    $sslStream.AuthenticateAsClient($domainName)
-                    $cert = $sslStream.RemoteCertificate
-                    
+                    $cert = Get-CertificateFromDomain -DomainName $domainName
                     if ($cert) {
-                        $x509cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($cert)
-                        $expiryDate = $x509cert.NotAfter
-                        $subject = $x509cert.Subject
+                        $expiryDate = $cert.NotAfter
+                        $subject = $cert.Subject
                     }
                     
                     Write-Host " OK" -ForegroundColor Green
                 } catch {
-                    # Extract a cleaner error message
-                    $errorMsg = $_.Exception.Message
-                    if ($errorMsg -match '"([^"]+)"$') {
-                        $errorMsg = $matches[1]
-                    } elseif ($_.Exception.InnerException) {
-                        $errorMsg = $_.Exception.InnerException.Message
-                    }
+                    # Extract a cleaner error message from exception chain
+                    $innerEx = $_.Exception.InnerException
+                    while ($innerEx -and $innerEx.InnerException) { $innerEx = $innerEx.InnerException }
+                    $errorMsg = if ($innerEx) { $innerEx.Message } else { $_.Exception.Message }
                     Write-Host " Failed: $errorMsg" -ForegroundColor Yellow
-                } finally {
-                    if ($sslStream) { $sslStream.Dispose() }
-                    if ($tcpClient) { $tcpClient.Dispose() }
                 }
                 
                 # Format expiration date with status indicators
