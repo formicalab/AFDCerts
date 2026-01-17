@@ -12,37 +12,43 @@
     providing detailed information including certificate subject, provisioning state,
     validation state, and Key Vault details where applicable.
 
-    The script supports two execution modes:
-    - Single Front Door mode: Process a single Front Door in the current subscription
-    - Bulk processing mode: Process multiple Front Doors across multiple subscriptions
+    The script supports three execution modes:
+    - Single Front Door mode: Process a single Front Door by name in the current subscription
+    - Subscription mode: Scan all Front Door profiles in the current or specified subscription
+    - Tenant mode: Scan all Front Door profiles across all accessible subscriptions in the tenant
 
-.PARAMETER FrontDoorName
-    The name of the Front Door profile to inspect. Supports both Standard/Premium and Classic
+.PARAMETER ScanFrontDoor
+    The name of a single Front Door profile to inspect. Supports both Standard/Premium and Classic
     Front Door profiles. The script will automatically detect the Front Door type.
-    This parameter is used in SingleFrontDoor parameter set.
+    Requires -ResourceGroupName parameter.
 
-.PARAMETER CsvFilePath
-    Path to a CSV file containing Front Door configurations for bulk processing.
-    The CSV file must contain two columns:
-    - SubscriptionName: The name of the Azure subscription (not the ID)
-    - FrontDoorName: The name of the Front Door profile
-    
-    Example CSV content:
-    SubscriptionName,FrontDoorName
-    Production,prod-frontdoor-01
-    Production,prod-frontdoor-02
-    Development,dev-frontdoor-01
-    
-    The script will automatically sort by SubscriptionName to minimize context switches.
-    This parameter is used in BulkProcessing parameter set.
+.PARAMETER ResourceGroupName
+    The name of the resource group containing the Front Door profile.
+    Required when using -ScanFrontDoor parameter.
+
+.PARAMETER ScanSubscription
+    Scan all Front Door profiles in the specified subscription.
+    Accepts either a subscription name or subscription ID.
+    If an empty string is provided, uses the current subscription context.
+
+.PARAMETER ScanTenant
+    Switch to enable scanning all Front Door profiles across all accessible subscriptions
+    in the current Azure AD tenant.
+
+.PARAMETER FrontDoorType
+    Filter to scan only specific Front Door types. Valid values are:
+    - All: Scan both Standard/Premium and Classic Front Doors (default)
+    - StandardPremium: Scan only Standard/Premium Front Doors
+    - Classic: Scan only Classic Front Doors
+    Only applicable when using -ScanSubscription or -ScanTenant modes.
 
 .PARAMETER ExportCsvPath
     Optional path to export results as a CSV file. If specified, certificate details will be
     exported to this location for reporting and analysis purposes.
 
-.PARAMETER ApiVersion
-    The API version to use for Front Door REST API calls. Default is '2024-02-01'.
-    Override this parameter if you need to use a different API version for compatibility.
+.PARAMETER GridView
+    Display results in an interactive GridView window. Allows sorting, filtering, and
+    selecting results. Requires a graphical environment (not supported in headless sessions).
 
 .PARAMETER WarningDays
     Number of days before certificate expiration to show warning indicators. Default is 30 days.
@@ -58,39 +64,38 @@
     results are also exported to a CSV file.
 
 .EXAMPLE
-    .\get-frontdoor-certs.ps1 -FrontDoorName "my-frontdoor-profile"
+    .\get-frontdoor-certs.ps1 -ScanFrontDoor "my-frontdoor-profile" -ResourceGroupName "my-resource-group"
     
     Retrieves certificate information for the specified Front Door profile and displays
     results in a formatted table with color-coded status indicators.
 
 .EXAMPLE
-    .\get-frontdoor-certs.ps1 -FrontDoorName "my-frontdoor-profile" -ExportCsvPath "C:\Reports\certificates.csv"
+    .\get-frontdoor-certs.ps1 -ScanSubscription ""
     
-    Retrieves certificate information and exports the results to a CSV file for reporting.
+    Scans all Front Door profiles in the current subscription and displays certificate information.
 
 .EXAMPLE
-    .\get-frontdoor-certs.ps1 -FrontDoorName "my-frontdoor-profile" -WarningDays 60
+    .\get-frontdoor-certs.ps1 -ScanSubscription "Production"
+    
+    Scans all Front Door profiles in the "Production" subscription.
+
+.EXAMPLE
+    .\get-frontdoor-certs.ps1 -ScanTenant -ExportCsvPath "C:\Reports\all-certs.csv"
+    
+    Scans all Front Door profiles across all accessible subscriptions in the tenant
+    and exports results to CSV.
+
+.EXAMPLE
+    .\get-frontdoor-certs.ps1 -ScanSubscription "Production" -GridView
+    
+    Scans all Front Door profiles in the "Production" subscription and displays results
+    in an interactive GridView window for sorting and filtering.
+
+.EXAMPLE
+    .\get-frontdoor-certs.ps1 -ScanFrontDoor "my-frontdoor-profile" -ResourceGroupName "my-resource-group" -WarningDays 60
     
     Retrieves certificate information with a custom warning period of 60 days instead of
     the default 30 days.
-
-.EXAMPLE
-    .\get-frontdoor-certs.ps1 -FrontDoorName "my-frontdoor-profile" -ApiVersion "2023-05-01"
-    
-    Retrieves certificate information using a specific API version for compatibility.
-
-.EXAMPLE
-    $csvContent = @"
-SubscriptionName,FrontDoorName
-Production,prod-frontdoor-01
-Production,prod-frontdoor-02
-Development,dev-frontdoor-01
-"@
-    $csvContent | Out-File "frontdoors.csv"
-    .\get-frontdoor-certs.ps1 -CsvFilePath "frontdoors.csv" -ExportCsvPath "all-certs.csv"
-    
-    Creates a CSV file with Front Door configurations and processes them in bulk mode,
-    exporting consolidated results to CSV.
 
 .NOTES   
     Network Considerations:
@@ -102,7 +107,11 @@ Development,dev-frontdoor-01
     Authentication Requirements:
     - Must be authenticated to Azure (Connect-AzAccount)
     - Requires appropriate permissions to read Azure Front Door resources
-    - For bulk processing mode, requires access to all specified subscriptions
+    - For tenant mode, requires access to multiple subscriptions
+    
+    Module Requirements:
+    - Az.Accounts module is required for all modes
+    - Az.ResourceGraph module is required for -ScanTenant mode (Install-Module Az.ResourceGraph)
 
 .LINK
     https://github.com/formicalab/AFDCerts
@@ -120,16 +129,28 @@ using module Az.Accounts
 [CmdletBinding(DefaultParameterSetName = 'SingleFrontDoor')]
 param(
     [Parameter(Mandatory = $true, ParameterSetName = 'SingleFrontDoor', HelpMessage = 'Name of the Front Door profile to inspect (Standard/Premium or Classic)')]
-    [string]$FrontDoorName,
+    [string]$ScanFrontDoor,
 
-    [Parameter(Mandatory = $true, ParameterSetName = 'BulkProcessing', HelpMessage = 'Path to CSV file with SubscriptionName and FrontDoorName columns for bulk processing')]
-    [string]$CsvFilePath,
+    [Parameter(Mandatory = $true, ParameterSetName = 'SingleFrontDoor', HelpMessage = 'Resource group containing the Front Door profile')]
+    [string]$ResourceGroupName,
+
+    [Parameter(Mandatory = $true, ParameterSetName = 'ScanSubscription', HelpMessage = 'Subscription name or ID to scan (use empty string for current subscription)')]
+    [AllowEmptyString()]
+    [string]$ScanSubscription,
+
+    [Parameter(Mandatory = $true, ParameterSetName = 'ScanTenant', HelpMessage = 'Scan all Front Door profiles across all subscriptions in the tenant')]
+    [switch]$ScanTenant,
+
+    [Parameter(Mandatory = $false, ParameterSetName = 'ScanSubscription', HelpMessage = 'Filter by Front Door type: All, StandardPremium, or Classic')]
+    [Parameter(Mandatory = $false, ParameterSetName = 'ScanTenant')]
+    [ValidateSet('All', 'StandardPremium', 'Classic')]
+    [string]$FrontDoorType = 'All',
 
     [Parameter(Mandatory = $false, HelpMessage = 'Path to export CSV results (optional)')]
     [string]$ExportCsvPath,
 
-    [Parameter(Mandatory = $false, HelpMessage = 'API version to use for Front Door REST calls (override if needed)')]
-    [string]$ApiVersion = '2024-02-01',
+    [Parameter(Mandatory = $false, HelpMessage = 'Display results in an interactive GridView window')]
+    [switch]$GridView,
 
     [Parameter(Mandatory = $false, HelpMessage = 'Number of days before expiration to show warning (default: 30)')]
     [int]$WarningDays = 30
@@ -138,8 +159,17 @@ param(
 Set-StrictMode -Version 1
 $ErrorActionPreference = 'Stop'
 
-# Global variables
-$allResults = @()
+# API version constant
+$script:ApiVersion = '2025-04-15'
+
+# Verify Azure login
+$context = Get-AzContext
+if (-not $context) {
+    throw "Not logged in to Azure. Please run Connect-AzAccount first."
+}
+
+# Global results collection (using List for better append performance)
+$allResults = [System.Collections.Generic.List[PSCustomObject]]::new()
 
 #region Get-TruncatedString
 
@@ -279,6 +309,153 @@ function Get-FormattedExpirationDate {
 
 #endregion
 
+#region Get All Front Doors in Subscription
+
+# Function to get all Front Door profiles in the current subscription
+function Get-AllFrontDoorsInSubscription {
+    param(
+        [Parameter(Mandatory = $false)]
+        [ValidateSet('All', 'StandardPremium', 'Classic')]
+        [string]$TypeFilter = 'All'
+    )
+    
+    $frontDoors = @()
+    $context = Get-AzContext
+    
+    Write-Host "  Discovering Front Door profiles..." -ForegroundColor Cyan
+    if ($TypeFilter -ne 'All') {
+        Write-Host "    Filtering by type: $TypeFilter" -ForegroundColor Cyan
+    }
+    
+    # Get Standard/Premium Front Doors (Microsoft.Cdn/profiles with AzureFrontDoor SKU)
+    if ($TypeFilter -eq 'All' -or $TypeFilter -eq 'StandardPremium') {
+        try {
+            $cdnProfiles = Get-AzResource -ResourceType "Microsoft.Cdn/profiles" -ErrorAction SilentlyContinue
+            $afdProfiles = $cdnProfiles | Where-Object { 
+                $_.Sku.Name -eq 'Standard_AzureFrontDoor' -or $_.Sku.Name -eq 'Premium_AzureFrontDoor'
+            }
+            
+            foreach ($profile in $afdProfiles) {
+                $frontDoors += [PSCustomObject]@{
+                    Name = $profile.Name
+                    ResourceGroupName = $profile.ResourceGroupName
+                    Type = 'Standard/Premium'
+                }
+            }
+            Write-Host "    Found $($afdProfiles.Count) Standard/Premium Front Door(s)" -ForegroundColor Green
+        }
+        catch {
+            Write-Host "    Failed to query Standard/Premium Front Doors: $($_.Exception.Message)" -ForegroundColor Yellow
+        }
+    }
+    
+    # Get Classic Front Doors
+    if ($TypeFilter -eq 'All' -or $TypeFilter -eq 'Classic') {
+        try {
+            $classicFDs = Get-AzFrontDoor -ErrorAction SilentlyContinue
+            foreach ($fd in $classicFDs) {
+                $frontDoors += [PSCustomObject]@{
+                    Name = $fd.Name
+                    ResourceGroupName = $fd.ResourceGroupName
+                    Type = 'Classic'
+                }
+            }
+            Write-Host "    Found $($classicFDs.Count) Classic Front Door(s)" -ForegroundColor Green
+        }
+        catch {
+            Write-Host "    Failed to query Classic Front Doors: $($_.Exception.Message)" -ForegroundColor Yellow
+        }
+    }
+    
+    return $frontDoors
+}
+
+#endregion
+
+#region Get All Front Doors in Tenant (Resource Graph)
+
+# Function to get all Front Door profiles across all subscriptions using Azure Resource Graph
+function Get-AllFrontDoorsInTenant {
+    param(
+        [Parameter(Mandatory = $false)]
+        [ValidateSet('All', 'StandardPremium', 'Classic')]
+        [string]$TypeFilter = 'All'
+    )
+    
+    Write-Host "Querying Azure Resource Graph for all Front Door profiles..." -ForegroundColor Cyan
+    if ($TypeFilter -ne 'All') {
+        Write-Host "  Filtering by type: $TypeFilter" -ForegroundColor Cyan
+    }
+    
+    $frontDoors = @()
+    
+    # Query for Standard/Premium Front Doors (Microsoft.Cdn/profiles with AzureFrontDoor SKU)
+    $queryStdPremium = @"
+resources
+| where type == 'microsoft.cdn/profiles'
+| where sku.name in ('Standard_AzureFrontDoor', 'Premium_AzureFrontDoor')
+| project name, resourceGroup, subscriptionId, type, sku
+| order by subscriptionId, name
+"@
+
+    # Query for Classic Front Doors (Microsoft.Network/frontDoors)
+    $queryClassic = @"
+resources
+| where type == 'microsoft.network/frontdoors'
+| project name, resourceGroup, subscriptionId, type
+| order by subscriptionId, name
+"@
+
+    # Execute Standard/Premium query
+    if ($TypeFilter -eq 'All' -or $TypeFilter -eq 'StandardPremium') {
+        try {
+            Write-Host "  Querying Standard/Premium Front Doors..." -ForegroundColor Cyan
+            $stdPremiumResults = Search-AzGraph -Query $queryStdPremium -First 1000 -ErrorAction Stop
+            
+            foreach ($result in $stdPremiumResults) {
+                $frontDoors += [PSCustomObject]@{
+                    Name              = $result.name
+                    ResourceGroupName = $result.resourceGroup
+                    SubscriptionId    = $result.subscriptionId
+                    Type              = 'Standard/Premium'
+                }
+            }
+            Write-Host "    Found $($stdPremiumResults.Count) Standard/Premium Front Door(s)" -ForegroundColor Green
+        }
+        catch {
+            Write-Host "    Failed to query Standard/Premium Front Doors via Resource Graph: $($_.Exception.Message)" -ForegroundColor Yellow
+            Write-Host "    Make sure you have the Az.ResourceGraph module installed (Install-Module Az.ResourceGraph)" -ForegroundColor Yellow
+        }
+    }
+    
+    # Execute Classic query
+    if ($TypeFilter -eq 'All' -or $TypeFilter -eq 'Classic') {
+        try {
+            Write-Host "  Querying Classic Front Doors..." -ForegroundColor Cyan
+            $classicResults = Search-AzGraph -Query $queryClassic -First 1000 -ErrorAction Stop
+            
+            foreach ($result in $classicResults) {
+                $frontDoors += [PSCustomObject]@{
+                    Name              = $result.name
+                    ResourceGroupName = $result.resourceGroup
+                    SubscriptionId    = $result.subscriptionId
+                    Type              = 'Classic'
+                }
+            }
+            Write-Host "    Found $($classicResults.Count) Classic Front Door(s)" -ForegroundColor Green
+        }
+        catch {
+            Write-Host "    Failed to query Classic Front Doors via Resource Graph: $($_.Exception.Message)" -ForegroundColor Yellow
+        }
+    }
+    
+    Write-Host "  Total: $($frontDoors.Count) Front Door profile(s) found across tenant`n" -ForegroundColor Cyan
+    
+    return $frontDoors
+}
+
+#endregion
+
 #region Front Door Certificate Processing
 
 # Main function to process a single Front Door
@@ -287,8 +464,8 @@ function Get-FrontDoorCertificates {
         [Parameter(Mandatory = $true)]
         [string]$FrontDoorName,
         
-        [Parameter(Mandatory = $true)]
-        [string]$ApiVersion,
+        [Parameter(Mandatory = $false)]
+        [string]$ResourceGroupName,
         
         [Parameter(Mandatory = $true)]
         [int]$WarningDays
@@ -298,18 +475,24 @@ function Get-FrontDoorCertificates {
     
     # Get current context
     $context = Get-AzContext
-    if (-not $context) {
-        throw "Not logged in to Azure. Please run Connect-AzAccount first."
-    }
     
-    Write-Host "Looking for Front Door profile: $FrontDoorName in subscription: $($context.Subscription.Name)..." -ForegroundColor Cyan
+    $rgDisplay = if ($ResourceGroupName) { ", resource group: $ResourceGroupName" } else { "" }
+    Write-Host "Looking for Front Door profile: $FrontDoorName in subscription: $($context.Subscription.Name)$rgDisplay..." -ForegroundColor Cyan
 
     # Try to find Standard/Premium Front Door first
-    $fd = Get-AzResource -Name $FrontDoorName -ResourceType "Microsoft.Cdn/profiles" -ErrorAction SilentlyContinue
+    if ($ResourceGroupName) {
+        $fd = Get-AzResource -Name $FrontDoorName -ResourceGroupName $ResourceGroupName -ResourceType "Microsoft.Cdn/profiles" -ErrorAction SilentlyContinue
+    } else {
+        $fd = Get-AzResource -Name $FrontDoorName -ResourceType "Microsoft.Cdn/profiles" -ErrorAction SilentlyContinue
+    }
 
     # If not found, try Classic Front Door
     if (-not $fd) {
-        $fdClassic = Get-AzFrontDoor -Name $FrontDoorName -ErrorAction SilentlyContinue
+        if ($ResourceGroupName) {
+            $fdClassic = Get-AzFrontDoor -Name $FrontDoorName -ResourceGroupName $ResourceGroupName -ErrorAction SilentlyContinue
+        } else {
+            $fdClassic = Get-AzFrontDoor -Name $FrontDoorName -ErrorAction SilentlyContinue
+        }
         if ($fdClassic) {
             Write-Host "  Found Classic Front Door: $FrontDoorName" -ForegroundColor Green
             $isClassic = $true
@@ -329,8 +512,20 @@ function Get-FrontDoorCertificates {
         
         Write-Host "  Retrieving custom domains..."
         
-        # Get all frontend endpoints (custom domains) from Classic Front Door
-        $endpoints = $fdClassic | Get-AzFrontDoorFrontendEndpoint
+        # Get resource group from the Classic Front Door object
+        $classicRg = $fdClassic.ResourceGroupName
+        if (-not $classicRg -and $ResourceGroupName) {
+            $classicRg = $ResourceGroupName
+        }
+        
+        # Get all frontend endpoints (custom domains) from Classic Front Door using explicit parameters
+        try {
+            $endpoints = Get-AzFrontDoorFrontendEndpoint -FrontDoorName $FrontDoorName -ResourceGroupName $classicRg -ErrorAction Stop
+        }
+        catch {
+            Write-Host "  Failed to retrieve endpoints: $($_.Exception.Message)" -ForegroundColor Yellow
+            $endpoints = $null
+        }
         
         if (-not $endpoints -or $endpoints.Count -eq 0) {
             Write-Host "  No custom domains found for Classic Front Door $FrontDoorName" -ForegroundColor Yellow
@@ -381,7 +576,14 @@ function Get-FrontDoorCertificates {
                     
                     Write-Host " OK" -ForegroundColor Green
                 } catch {
-                    Write-Host " Failed: $($_.Exception.Message)" -ForegroundColor Yellow
+                    # Extract a cleaner error message
+                    $errorMsg = $_.Exception.Message
+                    if ($errorMsg -match '"([^"]+)"$') {
+                        $errorMsg = $matches[1]
+                    } elseif ($_.Exception.InnerException) {
+                        $errorMsg = $_.Exception.InnerException.Message
+                    }
+                    Write-Host " Failed: $errorMsg" -ForegroundColor Yellow
                 } finally {
                     if ($sslStream) { $sslStream.Dispose() }
                     if ($tcpClient) { $tcpClient.Dispose() }
@@ -538,70 +740,88 @@ Write-Host "Execution Mode: $($PSCmdlet.ParameterSetName)`n" -ForegroundColor Cy
 
 if ($PSCmdlet.ParameterSetName -eq 'SingleFrontDoor') {
     # Single Front Door mode
-    $allResults = Get-FrontDoorCertificates -FrontDoorName $FrontDoorName -ApiVersion $ApiVersion -WarningDays $WarningDays
-} else {
-    # Bulk processing mode - read CSV file
-    Write-Host "Reading Front Door list from CSV: $CsvFilePath..." -ForegroundColor Cyan
-    
-    if (-not (Test-Path $CsvFilePath)) {
-        throw "CSV file not found: $CsvFilePath"
-    }
-    
-    try {
-        $frontDoorList = Import-Csv -Path $CsvFilePath -ErrorAction Stop
-    }
-    catch {
-        throw "Failed to read CSV file: $($_.Exception.Message)"
-    }
-    
-    # Validate CSV columns
-    $requiredColumns = @('SubscriptionName', 'FrontDoorName')
-    $csvColumns = $frontDoorList[0].PSObject.Properties.Name
-    foreach ($col in $requiredColumns) {
-        if ($col -notin $csvColumns) {
-            throw "CSV file must contain '$col' column. Found columns: $($csvColumns -join ', ')"
-        }
-    }
-    
-    Write-Host "Found $($frontDoorList.Count) Front Door profile(s) in CSV" -ForegroundColor Cyan
-    Write-Host "Sorting by subscription to minimize context switches...`n" -ForegroundColor Cyan
-    
-    # Sort by SubscriptionName to minimize context switches
-    $sortedList = $frontDoorList | Sort-Object SubscriptionName
-    
-    # Group by subscription for efficient processing
-    $groupedBySubscription = $sortedList | Group-Object SubscriptionName
-    
-    Write-Host "Found $($groupedBySubscription.Count) unique subscription(s)`n" -ForegroundColor Cyan
-    
-    foreach ($subGroup in $groupedBySubscription) {
-        $subscriptionName = $subGroup.Name
-        $frontDoorsInSub = $subGroup.Group
-        
-        Write-Host "Processing $($frontDoorsInSub.Count) Front Door(s) in subscription: $subscriptionName" -ForegroundColor Yellow
-        Write-Host ("=" * 80) -ForegroundColor Yellow
-        
-        # Switch to the subscription by name
+    $results = Get-FrontDoorCertificates -FrontDoorName $ScanFrontDoor -ResourceGroupName $ResourceGroupName -WarningDays $WarningDays
+    $results | ForEach-Object { $allResults.Add($_) }
+} 
+elseif ($PSCmdlet.ParameterSetName -eq 'ScanSubscription') {
+    # Subscription scanning mode
+    if ($ScanSubscription) {
+        Write-Host "Switching to subscription: $ScanSubscription..." -ForegroundColor Cyan
         try {
-            $context = Set-AzContext -Subscription $subscriptionName -ErrorAction Stop
+            $null = Set-AzContext -Subscription $ScanSubscription -ErrorAction Stop
         }
         catch {
-            Write-Host "  Failed to switch to subscription '$subscriptionName': $($_.Exception.Message)" -ForegroundColor Red
-            Write-Host "  Skipping $($frontDoorsInSub.Count) Front Door(s) in this subscription`n" -ForegroundColor Yellow
-            continue
+            throw "Failed to switch to subscription '$ScanSubscription': $($_.Exception.Message)"
         }
+    }
+    
+    $context = Get-AzContext
+    Write-Host "Scanning subscription: $($context.Subscription.Name) ($($context.Subscription.Id))" -ForegroundColor Cyan
+    Write-Host ("=" * 80) -ForegroundColor Yellow
+    
+    # Get all Front Doors in the subscription
+    $frontDoors = Get-AllFrontDoorsInSubscription -TypeFilter $FrontDoorType
+    
+    if ($frontDoors.Count -eq 0) {
+        Write-Host "  No Front Door profiles found in this subscription" -ForegroundColor Yellow
+    } else {
+        Write-Host "  Processing $($frontDoors.Count) Front Door profile(s)...`n" -ForegroundColor Cyan
         
-        # Process each Front Door in this subscription
-        foreach ($fdItem in $frontDoorsInSub) {
+        foreach ($fd in $frontDoors) {
             $fdResults = Get-FrontDoorCertificates `
-                -FrontDoorName $fdItem.FrontDoorName `
-                -ApiVersion $ApiVersion `
+                -FrontDoorName $fd.Name `
+                -ResourceGroupName $fd.ResourceGroupName `
                 -WarningDays $WarningDays
             
-            $allResults += $fdResults
+            $fdResults | ForEach-Object { $allResults.Add($_) }
         }
+    }
+}
+elseif ($PSCmdlet.ParameterSetName -eq 'ScanTenant') {
+    # Tenant-wide scanning mode using Azure Resource Graph
+    Write-Host "Scanning all Front Door profiles across tenant using Resource Graph..." -ForegroundColor Cyan
+    
+    # Get all Front Doors across tenant using Resource Graph
+    $allFrontDoors = Get-AllFrontDoorsInTenant -TypeFilter $FrontDoorType
+    
+    if ($allFrontDoors.Count -eq 0) {
+        Write-Host "No Front Door profiles found in the tenant." -ForegroundColor Yellow
+    } else {
+        # Group by subscription to minimize context switches
+        $groupedBySubscription = $allFrontDoors | Group-Object SubscriptionId | Sort-Object Name
         
-        Write-Host ""
+        Write-Host "Found Front Door profiles in $($groupedBySubscription.Count) subscription(s)" -ForegroundColor Cyan
+        Write-Host "Processing sorted by subscription to minimize context switches...`n" -ForegroundColor Cyan
+        
+        $subscriptionCount = 0
+        foreach ($subGroup in $groupedBySubscription) {
+            $subscriptionCount++
+            $subscriptionId = $subGroup.Name
+            $frontDoorsInSub = $subGroup.Group
+            
+            # Switch to the subscription
+            try {
+                $context = Set-AzContext -Subscription $subscriptionId -ErrorAction Stop
+                Write-Host "[$subscriptionCount/$($groupedBySubscription.Count)] Processing $($frontDoorsInSub.Count) Front Door(s) in subscription: $($context.Subscription.Name)" -ForegroundColor Yellow
+                Write-Host ("=" * 80) -ForegroundColor Yellow
+            }
+            catch {
+                Write-Host "[$subscriptionCount/$($groupedBySubscription.Count)] Failed to switch to subscription '$subscriptionId': $($_.Exception.Message)" -ForegroundColor Red
+                Write-Host "  Skipping $($frontDoorsInSub.Count) Front Door(s) in this subscription`n" -ForegroundColor Yellow
+                continue
+            }
+            
+            # Process each Front Door in this subscription
+            foreach ($fd in $frontDoorsInSub) {
+                $fdResults = Get-FrontDoorCertificates `
+                    -FrontDoorName $fd.Name `
+                    -ResourceGroupName $fd.ResourceGroupName `
+                    -WarningDays $WarningDays
+                
+                $fdResults | ForEach-Object { $allResults.Add($_) }
+            }
+            Write-Host ""
+        }
     }
 }
 
@@ -651,12 +871,12 @@ if ($allResults.Count -eq 0) {
         
         # Simplify certificate type display
         $certType = $result.CertificateType
-        if ($certType -like '*KeyVault*' -or $certType -like '*CustomerCertificate*') {
-            $certTypeDisplay = 'KeyVault'
-        } elseif ($certType -like '*Managed*' -or $certType -eq 'FrontDoor') {
-            $certTypeDisplay = 'Managed'
-        } else {
-            $certTypeDisplay = $certType
+        $certTypeDisplay = switch -Wildcard ($certType) {
+            '*KeyVault*' { 'KeyVault' }
+            '*CustomerCertificate*' { 'KeyVault' }
+            '*Managed*' { 'Managed' }
+            'FrontDoor' { 'Managed' }
+            default { $certType }
         }
         $dispCertType = Get-TruncatedString $certTypeDisplay ($colCertType - 1)
         
@@ -742,5 +962,13 @@ if ($allResults.Count -eq 0) {
     if ($ExportCsvPath) {
         $allResults | Export-Csv -Path $ExportCsvPath -NoTypeInformation -Force
         Write-Host "`nResults exported to: $ExportCsvPath" -ForegroundColor Green
+    }
+    
+    # Display in GridView if requested
+    if ($GridView) {
+        Write-Host "`nOpening GridView..." -ForegroundColor Cyan
+        $allResults | Select-Object SubscriptionName, FrontDoorName, FrontDoorType, Domain, CertificateType, `
+            ProvisioningState, ValidationState, Subject, ExpirationDate, ExpirationStatus, `
+            KeyVaultName, KeyVaultSecretName | Out-GridView -Title "Azure Front Door Certificates"
     }
 }
