@@ -9,8 +9,11 @@
     results to CSV for reporting.
 
     The script supports both Azure-managed certificates and custom certificates from Key Vault,
-    providing detailed information including certificate subject, provisioning state,
-    validation state, and Key Vault details where applicable.
+    providing detailed information including certificate subject, issuing CA, provisioning state,
+    validation state, trust-chain details, and Key Vault details where applicable.
+
+    Default Azure Front Door hostnames (*.azurefd.net) are skipped automatically so the output
+    stays focused on customer-facing domains that typically need operational follow-up.
 
     The script supports three execution modes:
     - Single Front Door mode: Process a single Front Door by name in the current subscription
@@ -44,11 +47,13 @@
 
 .PARAMETER ExportCsvPath
     Optional path to export results as a CSV file. If specified, certificate details will be
-    exported to this location for reporting and analysis purposes.
+    exported to this location for reporting and analysis purposes. The parent directory is
+    created automatically when it does not already exist. Cannot be combined with -GridView.
 
 .PARAMETER GridView
     Display results in an interactive GridView window. Allows sorting, filtering, and
     selecting results. Requires a graphical environment (not supported in headless sessions).
+    Cannot be combined with -ExportCsvPath.
 
 .PARAMETER WarningDays
     Number of days before certificate expiration to show warning indicators. Default is 30 days.
@@ -68,14 +73,24 @@
     Timeout in milliseconds for TLS certificate fetch operations. Default is 5000ms (5 seconds).
     Increase if operating through slow proxies or high-latency networks.
 
+.PARAMETER RestRetryCount
+    Maximum number of attempts for transient Azure REST API failures. Default is 3.
+
+.PARAMETER TlsRetryCount
+    Maximum number of attempts for transient live TLS probe failures. Default is 2.
+
+.PARAMETER RetryBaseDelayMs
+    Base delay in milliseconds for exponential retry backoff. Default is 500ms.
+
 .INPUTS
     None. This script does not accept pipeline input.
 
 .OUTPUTS
     System.Object[]
     The script outputs a formatted table showing certificate details and returns an array of
-    custom objects containing certificate information. If ExportCsvPath is specified,
-    results are also exported to a CSV file.
+    custom objects containing certificate information, including issuer, issuing CA, and
+    certificate-chain details. If ExportCsvPath is specified, results are also exported to a
+    CSV file using a stable column set.
 
 .EXAMPLE
     .\get-frontdoor-certs.ps1 -ScanFrontDoor "my-frontdoor-profile" -ResourceGroupName "my-resource-group"
@@ -123,6 +138,11 @@
     Scans only Classic Front Door profiles with an extended TLS timeout of 10 seconds.
     Useful when operating through slow proxies.
 
+.EXAMPLE
+    .\get-frontdoor-certs.ps1 -ScanTenant -RestRetryCount 4 -TlsRetryCount 3 -RetryBaseDelayMs 750
+
+    Scans the tenant with additional retry tolerance for transient ARM API and TLS failures.
+
 .NOTES   
     Network Considerations:
     - For Classic Front Door, the script uses TcpClient + SslStream to fetch certificates
@@ -144,7 +164,10 @@
     - Tenant mode uses parallel processing for faster scanning
     - ThrottleLimit controls parallelism for ARM API calls (Standard/Premium FDs)
     - TlsThrottleLimit controls parallelism for TLS certificate probing (Classic FDs)
+    - RestRetryCount and TlsRetryCount apply exponential backoff for transient failures
     - Progress updates are batched to reduce console I/O overhead
+        - Default Azure Front Door hostnames (*.azurefd.net) are skipped automatically
+            to focus on actionable customer-facing certificates
 
 .LINK
     https://github.com/formicalab/AFDCerts
@@ -198,16 +221,29 @@ param(
 
     [Parameter(Mandatory = $false, HelpMessage = 'Timeout in milliseconds for TLS certificate checks (default: 5000)')]
     [ValidateRange(1000, 30000)]
-    [int]$TlsTimeoutMs = 5000
+    [int]$TlsTimeoutMs = 5000,
+
+    [Parameter(Mandatory = $false, HelpMessage = 'Maximum attempts for transient Azure REST API failures (default: 3)')]
+    [ValidateRange(1, 10)]
+    [int]$RestRetryCount = 3,
+
+    [Parameter(Mandatory = $false, HelpMessage = 'Maximum attempts for transient live TLS probe failures (default: 2)')]
+    [ValidateRange(1, 5)]
+    [int]$TlsRetryCount = 2,
+
+    [Parameter(Mandatory = $false, HelpMessage = 'Base delay in milliseconds for exponential retry backoff (default: 500)')]
+    [ValidateRange(100, 5000)]
+    [int]$RetryBaseDelayMs = 500
 )
 
 Set-StrictMode -Version 1
 $ErrorActionPreference = 'Stop'
 
-# API version constant
+# API versions used for the Standard/Premium and Classic ARM queries.
 $script:ApiVersion = '2025-04-15'
+$script:ClassicApiVersion = '2021-06-01'
 
-# Check for system proxy configuration once at startup
+# Resolve the process-wide proxy once so direct and parallel TLS probes use the same path.
 $script:ProxyUri = $null
 $proxyTestUri = [Uri]"https://azure.microsoft.com"
 $systemProxy = [System.Net.WebRequest]::GetSystemWebProxy()
@@ -377,7 +413,9 @@ function Invoke-ResourceGraphQueryAllPages {
             options       = $options
         } | ConvertTo-Json -Depth 8
 
-        $response = Invoke-RestMethod -Method Post -Uri $graphUri -Headers $Headers -Body $body -ErrorAction Stop
+        $response = Invoke-WithRetry -Action {
+            Invoke-RestMethod -Method Post -Uri $graphUri -Headers $Headers -Body $body -ErrorAction Stop
+        } -OperationName 'Resource Graph query' -Category Rest -MaxAttempts $RestRetryCount -BaseDelayMs $RetryBaseDelayMs
         foreach ($row in @($response.data)) {
             $results.Add($row)
         }
@@ -410,6 +448,174 @@ function Get-ProgressInterval {
     return [Math]::Max([int][Math]::Ceiling($TotalCount / 20.0), 1)
 }
 
+# Pulls an HTTP status code out of nested exception shapes returned by REST calls.
+function Get-HttpStatusCodeFromException {
+    param(
+        [Parameter(Mandatory = $false)]
+        [AllowNull()]
+        [System.Exception]$Exception
+    )
+
+    if (-not $Exception) {
+        return $null
+    }
+
+    foreach ($propertyName in 'StatusCode', 'Response') {
+        $property = $Exception.PSObject.Properties[$propertyName]
+        if (-not $property) {
+            continue
+        }
+
+        try {
+            if ($propertyName -eq 'StatusCode' -and $null -ne $property.Value) {
+                return [int]$property.Value
+            }
+
+            if ($propertyName -eq 'Response' -and $property.Value -and $property.Value.StatusCode) {
+                return [int]$property.Value.StatusCode
+            }
+        }
+        catch {
+        }
+    }
+
+    if ($Exception.InnerException -and $Exception.InnerException -ne $Exception) {
+        return Get-HttpStatusCodeFromException -Exception $Exception.InnerException
+    }
+
+    return $null
+}
+
+# Identifies Azure REST failures that are worth retrying with backoff.
+function Test-IsTransientRestFailure {
+    param(
+        [Parameter(Mandatory = $false)]
+        [AllowNull()]
+        [System.Exception]$Exception
+    )
+
+    if (-not $Exception) {
+        return $false
+    }
+
+    $statusCode = Get-HttpStatusCodeFromException -Exception $Exception
+    if ($null -ne $statusCode) {
+        return $statusCode -in 408, 409, 429, 500, 502, 503, 504
+    }
+
+    $messageParts = [System.Collections.Generic.List[string]]::new()
+    $currentException = $Exception
+    while ($currentException) {
+        if (-not [string]::IsNullOrWhiteSpace($currentException.Message)) {
+            $messageParts.Add($currentException.Message)
+        }
+
+        if (-not $currentException.InnerException -or $currentException.InnerException -eq $currentException) {
+            break
+        }
+
+        $currentException = $currentException.InnerException
+    }
+
+    $message = ($messageParts -join ' ')
+    return $message -match 'timed out|timeout|temporar|throttl|too many requests|connection.+(reset|aborted|closed)|remote party closed|EOF|unexpected end'
+}
+
+# Identifies transient network and proxy failures during live TLS probes.
+function Test-IsTransientTlsFailure {
+    param(
+        [Parameter(Mandatory = $false)]
+        [AllowNull()]
+        [System.Exception]$Exception,
+
+        [Parameter(Mandatory = $false)]
+        [string]$FailureMessage
+    )
+
+    $messageParts = [System.Collections.Generic.List[string]]::new()
+    if (-not [string]::IsNullOrWhiteSpace($FailureMessage)) {
+        $messageParts.Add($FailureMessage)
+    }
+
+    $currentException = $Exception
+    while ($currentException) {
+        if (-not [string]::IsNullOrWhiteSpace($currentException.Message)) {
+            $messageParts.Add($currentException.Message)
+        }
+
+        if (-not $currentException.InnerException -or $currentException.InnerException -eq $currentException) {
+            break
+        }
+
+        $currentException = $currentException.InnerException
+    }
+
+    $message = ($messageParts -join ' ')
+    if ([string]::IsNullOrWhiteSpace($message)) {
+        return $false
+    }
+
+    return $message -match 'timed out|timeout|temporar|connection.+(reset|aborted|closed)|remote party closed|EOF|unexpected end|network.+unreachable|host.+unreachable|Proxy CONNECT failed: HTTP/\d\.\d (429|502|503|504)'
+}
+
+# Applies capped exponential backoff between retry attempts.
+function Get-RetryDelayMilliseconds {
+    param(
+        [Parameter(Mandatory)]
+        [int]$Attempt,
+
+        [Parameter(Mandatory)]
+        [int]$BaseDelayMs
+    )
+
+    $multiplier = [Math]::Pow(2, [Math]::Max($Attempt - 1, 0))
+    return [int][Math]::Min([Math]::Round($BaseDelayMs * $multiplier), 10000)
+}
+
+# Wraps REST and TLS operations with the shared transient-failure retry policy.
+function Invoke-WithRetry {
+    param(
+        [Parameter(Mandatory)]
+        [scriptblock]$Action,
+
+        [Parameter(Mandatory)]
+        [string]$OperationName,
+
+        [Parameter(Mandatory)]
+        [ValidateSet('Rest', 'Tls')]
+        [string]$Category,
+
+        [Parameter(Mandatory)]
+        [int]$MaxAttempts,
+
+        [Parameter(Mandatory)]
+        [int]$BaseDelayMs
+    )
+
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        try {
+            return & $Action
+        }
+        catch {
+            $exception = $_.Exception
+            $isTransient = if ($Category -eq 'Rest') {
+                Test-IsTransientRestFailure -Exception $exception
+            }
+            else {
+                Test-IsTransientTlsFailure -Exception $exception -FailureMessage $exception.Message
+            }
+
+            if (-not $isTransient -or $attempt -ge $MaxAttempts) {
+                throw
+            }
+
+            $delayMs = Get-RetryDelayMilliseconds -Attempt $attempt -BaseDelayMs $BaseDelayMs
+            Write-Verbose ("Retrying {0} after transient {1} failure (attempt {2}/{3}, delay={4}ms): {5}" -f $OperationName, $Category, ($attempt + 1), $MaxAttempts, $delayMs, $exception.Message)
+            Start-Sleep -Milliseconds $delayMs
+        }
+    }
+}
+
 #endregion
 
 # Verify Azure login
@@ -418,29 +624,35 @@ if (-not $context) {
     throw "Not logged in to Azure. Please run Connect-AzAccount first."
 }
 
+if ($GridView -and $ExportCsvPath) {
+    throw "Use either -GridView or -ExportCsvPath, not both."
+}
+
 # Global results collection (using List for better append performance)
 $allResults = [System.Collections.Generic.List[PSCustomObject]]::new()
 
 #region Certificate fetching for Classic Front Door
 
-# Helper function to get certificate from a domain using TcpClient + SslStream
-# Uses $script:ProxyUri detected at startup for HTTP CONNECT tunnel
+# Opens a live TLS session to a domain and returns the presented server certificate.
 function Get-CertificateFromDomain {
     param([string]$DomainName)
     
     $tcpClient = $null
     $sslStream = $null
     $networkStream = $null
+    $reader = $null
+    $writer = $null
     
     try {
         $tcpClient = [System.Net.Sockets.TcpClient]::new()
+        $tcpClient.SendTimeout = $TlsTimeoutMs
+        $tcpClient.ReceiveTimeout = $TlsTimeoutMs
         
         if ($script:ProxyUri) {
-            # Connect to proxy server
+            # Establish an HTTP CONNECT tunnel before starting the TLS handshake.
             $tcpClient.Connect($script:ProxyUri.Host, $script:ProxyUri.Port)
             $networkStream = $tcpClient.GetStream()
             
-            # Send HTTP CONNECT request to establish tunnel
             $writer = [System.IO.StreamWriter]::new($networkStream, [System.Text.Encoding]::ASCII)
             $writer.AutoFlush = $true
             $reader = [System.IO.StreamReader]::new($networkStream, [System.Text.Encoding]::ASCII)
@@ -449,26 +661,23 @@ function Get-CertificateFromDomain {
             $writer.WriteLine("Host: ${DomainName}:443")
             $writer.WriteLine("")
             
-            # Read proxy response
             $response = $reader.ReadLine()
             if ($response -notmatch "^HTTP/\d\.\d 200") {
                 throw "Proxy CONNECT failed: $response"
             }
             
-            # Read and discard remaining headers until empty line
             while ($true) {
                 $line = $reader.ReadLine()
                 if ([string]::IsNullOrEmpty($line)) { break }
             }
             
-            # Now the tunnel is established, perform TLS handshake through it
             $sslStream = [System.Net.Security.SslStream]::new(
                 $networkStream,
                 $false,
                 { param($s, $certificate, $chain, $sslPolicyErrors) return $true }
             )
         } else {
-            # Direct connection (no proxy)
+            # Fall back to a direct TLS handshake when no proxy is configured.
             $tcpClient.Connect($DomainName, 443)
             
             $sslStream = [System.Net.Security.SslStream]::new(
@@ -487,6 +696,8 @@ function Get-CertificateFromDomain {
         return $null
     }
     finally {
+        if ($writer) { $writer.Dispose() }
+        if ($reader) { $reader.Dispose() }
         if ($sslStream) { $sslStream.Dispose() }
         if ($tcpClient) { $tcpClient.Dispose() }
     }
@@ -494,9 +705,272 @@ function Get-CertificateFromDomain {
 
 #endregion
 
+#region Certificate Metadata Helpers
+
+# Normalizes issuer metadata into a full issuer string plus a friendly issuing-CA name.
+function Get-IssuerDetails {
+    param(
+        [Parameter(Mandatory = $false)]
+        [System.Security.Cryptography.X509Certificates.X509Certificate2]$Certificate,
+
+        [Parameter(Mandatory = $false)]
+        [string]$IssuerString,
+
+        [Parameter(Mandatory = $false)]
+        [string]$IssuingCAName
+    )
+
+    $issuer = $IssuerString
+    if (-not $issuer -and $Certificate) {
+        $issuer = $Certificate.Issuer
+    }
+
+    $issuingCA = $IssuingCAName
+    if (-not $issuingCA -and $Certificate) {
+        try {
+            $issuingCA = $Certificate.GetNameInfo([System.Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $true)
+        }
+        catch {
+            $issuingCA = $null
+        }
+    }
+
+    if (-not $issuingCA -and $issuer) {
+        if ($issuer -match '(^|,\s*)CN=([^,]+)') {
+            $issuingCA = $matches[2].Trim()
+        }
+        elseif ($issuer -match '(^|,\s*)O=([^,]+)') {
+            $issuingCA = $matches[2].Trim()
+        }
+        else {
+            $issuingCA = $issuer
+        }
+    }
+
+    return @{
+        Issuer    = $issuer
+        IssuingCA = $issuingCA
+    }
+}
+
+# Builds a readable display name from a certificate subject or issuer distinguished name.
+function Get-CertificateDisplayName {
+    param(
+        [Parameter(Mandatory = $false)]
+        [System.Security.Cryptography.X509Certificates.X509Certificate2]$Certificate,
+
+        [Parameter(Mandatory = $false)]
+        [string]$DistinguishedName
+    )
+
+    $displayName = $null
+    if ($Certificate) {
+        try {
+            $displayName = $Certificate.GetNameInfo([System.Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false)
+        }
+        catch {
+            $displayName = $null
+        }
+
+        if (-not $DistinguishedName) {
+            $DistinguishedName = $Certificate.Subject
+        }
+    }
+
+    if (-not $displayName -and $DistinguishedName) {
+        if ($DistinguishedName -match '(^|,\s*)CN=([^,]+)') {
+            $displayName = $matches[2].Trim()
+        }
+        elseif ($DistinguishedName -match '(^|,\s*)O=([^,]+)') {
+            $displayName = $matches[2].Trim()
+        }
+        else {
+            $displayName = $DistinguishedName
+        }
+    }
+
+    return $displayName
+}
+
+# Summarizes the non-success statuses reported by an X509 chain build.
+function Get-ChainStatusSummary {
+    param(
+        [Parameter(Mandatory = $false)]
+        [System.Security.Cryptography.X509Certificates.X509Chain]$Chain
+    )
+
+    if (-not $Chain) {
+        return $null
+    }
+
+    $statuses = @(
+        $Chain.ChainStatus |
+            Where-Object { $_.Status -ne [System.Security.Cryptography.X509Certificates.X509ChainStatusFlags]::NoError } |
+            ForEach-Object { [string]$_.Status } |
+            Select-Object -Unique
+    )
+
+    if (-not $statuses -or $statuses.Count -eq 0) {
+        return 'Valid'
+    }
+
+    return ($statuses -join ',')
+}
+
+# Builds chain metadata for reporting from a live certificate or REST-provided issuer data.
+function Get-CertificateChainDetails {
+    param(
+        [Parameter(Mandatory = $false)]
+        [System.Security.Cryptography.X509Certificates.X509Certificate2]$Certificate,
+
+        [Parameter(Mandatory = $false)]
+        [string]$IssuerString,
+
+        [Parameter(Mandatory = $false)]
+        [string]$IssuingCAName
+    )
+
+    if (-not $Certificate) {
+        return @{
+            Subject                = $null
+            Issuer                 = $IssuerString
+            IssuingCA              = $IssuingCAName
+            ServerCertificateCount = $null
+            IntermediateCA         = $null
+            RootCA                 = $null
+            ChainStatus            = $null
+            DigiCertIssued         = $null
+        }
+    }
+
+    $issuerDetails = Get-IssuerDetails -Certificate $Certificate -IssuerString $IssuerString -IssuingCAName $IssuingCAName
+    $serverCertificateCount = 1
+    $intermediateCA = $null
+    $rootCA = $null
+    $chainStatus = $null
+    $digiCertIssued = $false
+    $chain = [System.Security.Cryptography.X509Certificates.X509Chain]::new()
+
+    try {
+        # Keep chain building local and fast; revocation checks would add extra network dependency.
+        $chain.ChainPolicy.RevocationMode = [System.Security.Cryptography.X509Certificates.X509RevocationMode]::NoCheck
+        $chain.ChainPolicy.RevocationFlag = [System.Security.Cryptography.X509Certificates.X509RevocationFlag]::ExcludeRoot
+        $chain.ChainPolicy.VerificationFlags = [System.Security.Cryptography.X509Certificates.X509VerificationFlags]::NoFlag
+        $null = $chain.Build($Certificate)
+
+        $chainElements = @($chain.ChainElements)
+        if ($chainElements.Count -gt 0) {
+            $serverCertificateCount = $chainElements.Count
+            $chainStatus = Get-ChainStatusSummary -Chain $chain
+
+            $lastElementCertificate = $chainElements[$chainElements.Count - 1].Certificate
+            $lastIsSelfSigned = $lastElementCertificate -and ($lastElementCertificate.Subject -eq $lastElementCertificate.Issuer)
+
+            $intermediateCertificates = @()
+            # Treat a self-signed last element as the root and everything between leaf and root as intermediates.
+            if ($chainElements.Count -ge 3 -or $lastIsSelfSigned) {
+                $rootCA = Get-CertificateDisplayName -Certificate $lastElementCertificate
+                if ($chainElements.Count -gt 2) {
+                    $intermediateCertificates = @($chainElements[1..($chainElements.Count - 2)] | ForEach-Object { $_.Certificate })
+                }
+            }
+            elseif ($chainElements.Count -gt 1) {
+                $intermediateCertificates = @($chainElements[1..($chainElements.Count - 1)] | ForEach-Object { $_.Certificate })
+            }
+
+            $intermediateNames = @(
+                $intermediateCertificates |
+                    ForEach-Object { Get-CertificateDisplayName -Certificate $_ } |
+                    Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+                    Select-Object -Unique
+            )
+            if ($intermediateNames.Count -gt 0) {
+                $intermediateCA = $intermediateNames -join ' | '
+            }
+        }
+    }
+    finally {
+        $chain.Dispose()
+    }
+
+    if ($issuerDetails.Issuer -match '\bDigiCert\b' -or $issuerDetails.IssuingCA -match '\bDigiCert\b' -or $intermediateCA -match '\bDigiCert\b' -or $rootCA -match '\bDigiCert\b') {
+        $digiCertIssued = $true
+    }
+
+    return @{
+        Subject                = $Certificate.Subject
+        Issuer                 = $issuerDetails.Issuer
+        IssuingCA              = $issuerDetails.IssuingCA
+        ServerCertificateCount = $serverCertificateCount
+        IntermediateCA         = $intermediateCA
+        RootCA                 = $rootCA
+        ChainStatus            = $chainStatus
+        DigiCertIssued         = $digiCertIssued
+    }
+}
+
+# Skips the default Azure Front Door hostname so output focuses on customer-facing domains.
+function Test-IsDefaultAzureFrontDoorHostname {
+    param(
+        [Parameter(Mandatory = $false)]
+        [string]$HostName
+    )
+
+    if ([string]::IsNullOrWhiteSpace($HostName)) {
+        return $false
+    }
+
+    return $HostName.EndsWith('.azurefd.net', [System.StringComparison]::OrdinalIgnoreCase)
+}
+
+# Returns a stable column projection for CSV export and GridView, even when mixed result objects
+# do not all expose the same properties.
+function Get-ResultExportColumns {
+    return @(
+        'SubscriptionId',
+        'SubscriptionName',
+        'FrontDoorName',
+        'FrontDoorType',
+        'Domain',
+        'CertificateType',
+        'ProvisioningState',
+        'ValidationState',
+        'Subject',
+        'Issuer',
+        'IssuingCA',
+        'ServerCertificateCount',
+        'IntermediateCA',
+        'RootCA',
+        'ChainStatus',
+        'DigiCertIssued',
+        'ExpirationDate',
+        'ExpirationStatus',
+        'KeyVaultName',
+        'KeyVaultSecretName'
+    )
+}
+
+# Creates the CSV parent directory when -ExportCsvPath points to a folder that does not exist yet.
+function Ensure-ParentDirectoryExists {
+    param(
+        [Parameter(Mandatory)]
+        [string]$FilePath
+    )
+
+    $resolvedFilePath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($FilePath)
+    $parentDirectory = Split-Path -Parent $resolvedFilePath
+    if ($parentDirectory -and -not (Test-Path -LiteralPath $parentDirectory)) {
+        $null = New-Item -ItemType Directory -Path $parentDirectory -Force
+    }
+
+    return $resolvedFilePath
+}
+
+#endregion
+
 #region Get-TruncatedString
 
-# Function to truncate any string to fit column width
+# Truncates display strings so the console table stays readable.
 function Get-TruncatedString {
     param(
         [string]$text,
@@ -514,14 +988,14 @@ function Get-TruncatedString {
 
 #region Dynamic Column Width Calculation
 
-# Function to calculate dynamic column widths based on console width
+# Fits the console table into the current window while protecting key columns.
 function Get-DynamicColumnWidths {
     param(
         [bool]$hasValidationState,
         [int]$minWidth = 80
     )
     
-    # Get console width, default to 160 if unable to determine
+    # Default to a reasonable width when the host cannot report console dimensions.
     try {
         $consoleWidth = $Host.UI.RawUI.WindowSize.Width
         if ($consoleWidth -lt $minWidth) { $consoleWidth = $minWidth }
@@ -530,12 +1004,10 @@ function Get-DynamicColumnWidths {
         $consoleWidth = 160
     }
     
-    # Calculate available width (subtract some for spacing and borders)
+    # Reserve a small padding budget for separators.
     $availableWidth = $consoleWidth - 10
     
-    # Define minimum widths for each column (required space)
-    # High priority columns: FrontDoor, FDType, Domain, CertType, ExpirationDate (never truncated), KVName
-    # Lower priority columns: Subscription, Subject, KVSecret (can be truncated if space is limited)
+    # Minimum widths keep the table usable on narrow consoles.
     $minWidths = @{
         Subscription = 15
         FrontDoor = 15
@@ -545,12 +1017,13 @@ function Get-DynamicColumnWidths {
         ProvState = 10
         ValState = 10
         Subject = 10
+        IssuingCA = 12
         ExpirationDate = 22
         KVName = 15
         KVSecret = 8
     }
     
-    # Define ideal widths (what we'd like if we have space)
+    # Ideal widths consume extra space on wider consoles without changing column order.
     $idealWidths = @{
         Subscription = 25
         FrontDoor = 26
@@ -560,20 +1033,19 @@ function Get-DynamicColumnWidths {
         ProvState = 12
         ValState = 12
         Subject = 25
+        IssuingCA = 24
         ExpirationDate = 22
         KVName = 22
         KVSecret = 20
     }
     
-    # Determine which columns to show based on mode
+    # Show validation state only when Standard/Premium rows are present.
     $columns = @('Subscription', 'FrontDoor', 'FDType', 'Domain', 'CertType', 'ProvState')
     if ($hasValidationState) { $columns += 'ValState' }
-    $columns += @('Subject', 'ExpirationDate', 'KVName', 'KVSecret')
+    $columns += @('Subject', 'IssuingCA', 'ExpirationDate', 'KVName', 'KVSecret')
     
-    # Calculate minimum required width
     $minRequired = ($columns | ForEach-Object { $minWidths[$_] + 1 } | Measure-Object -Sum).Sum
     
-    # If we have more space than minimum, distribute proportionally
     if ($availableWidth -gt $minRequired) {
         $extraSpace = $availableWidth - $minRequired
         $totalIdealExtra = ($columns | ForEach-Object { $idealWidths[$_] - $minWidths[$_] } | Measure-Object -Sum).Sum
@@ -589,7 +1061,6 @@ function Get-DynamicColumnWidths {
             }
         }
     } else {
-        # Use minimum widths if console is narrow
         $widths = @{}
         foreach ($col in $columns) {
             $widths[$col] = $minWidths[$col]
@@ -603,7 +1074,7 @@ function Get-DynamicColumnWidths {
 
 #region Date Formatting
 
-# Function to format expiration date with status indicators
+# Formats an expiration date consistently and classifies it against WarningDays.
 function Get-FormattedExpirationDate {
     param(
         [object]$expiryDate,
@@ -634,7 +1105,7 @@ function Get-FormattedExpirationDate {
 
 #region Get All Front Doors in Subscription
 
-# Function to get all Front Door profiles in the current subscription
+# Enumerates Front Door profiles in the current subscription using Az cmdlets.
 function Get-AllFrontDoorsInSubscription {
     param(
         [Parameter(Mandatory = $false)]
@@ -696,8 +1167,7 @@ function Get-AllFrontDoorsInSubscription {
 
 #region Get All Front Doors in Tenant (Resource Graph via REST API)
 
-# Function to get all Front Door profiles across all subscriptions using Azure Resource Graph REST API
-# This approach avoids the null tenant issue with Search-AzGraph cmdlet and supports proper pagination
+# Enumerates Front Door profiles across subscriptions through Resource Graph REST.
 function Get-AllFrontDoorsInTenant {
     param(
         [Parameter(Mandatory)]
@@ -794,7 +1264,7 @@ resources
 
 #region Front Door Certificate Processing
 
-# Main function to process a single Front Door
+# Collects certificate details for a single Front Door profile in the active subscription.
 function Get-FrontDoorCertificates {
     param(
         [Parameter(Mandatory = $true)]
@@ -866,9 +1336,26 @@ function Get-FrontDoorCertificates {
         if (-not $endpoints -or $endpoints.Count -eq 0) {
             Write-Host "  No custom domains found for Classic Front Door $FrontDoorName" -ForegroundColor Yellow
         } else {
-            Write-Host "  Found $($endpoints.Count) custom domain(s). Processing..."
+            $eligibleEndpoints = @(
+                $endpoints | Where-Object {
+                    $endpointHostName = if ([string]::IsNullOrWhiteSpace([string]$_.HostName)) { [string]$_.Name } else { [string]$_.HostName }
+                    -not (Test-IsDefaultAzureFrontDoorHostname -HostName $endpointHostName)
+                }
+            )
+            $skippedDefaultEndpoints = @($endpoints).Count - $eligibleEndpoints.Count
+
+            if ($skippedDefaultEndpoints -gt 0) {
+                Write-Host "  Skipping $skippedDefaultEndpoints default Azure Front Door endpoint(s)." -ForegroundColor Gray
+            }
+
+            if (-not $eligibleEndpoints -or $eligibleEndpoints.Count -eq 0) {
+                Write-Host "  No non-default custom domains found for Classic Front Door $FrontDoorName" -ForegroundColor Yellow
+                return $results
+            }
+
+            Write-Host "  Found $($eligibleEndpoints.Count) custom domain(s). Processing..."
             
-            foreach ($ep in $endpoints) {
+            foreach ($ep in $eligibleEndpoints) {
                 $domainName = $ep.HostName ?? $ep.Name
                 
                 Write-Host "    Fetching certificate for: $domainName..." -NoNewline
@@ -878,9 +1365,17 @@ function Get-FrontDoorCertificates {
                 $provisioningState = $ep.CustomHttpsProvisioningState
                 $expiryDate = $null
                 $subject = $null
+                $issuer = $null
+                $issuingCA = $null
+                $serverCertificateCount = $null
+                $intermediateCA = $null
+                $rootCA = $null
+                $chainStatus = $null
+                $digiCertIssued = $null
                 $keyVaultName = $null
                 $keyVaultSecretName = $null
-                $validationState = $null  # Classic Front Door does not expose domain validation state
+                # Classic rows keep ValidationState blank so mixed exports use one schema.
+                $validationState = $null
                 
                 # Extract Key Vault details if present
                 if ($ep.Vault) {
@@ -891,10 +1386,18 @@ function Get-FrontDoorCertificates {
                 # Fetch certificate from domain using TcpClient + SslStream
                 # Uses proxy if detected at startup ($script:ProxyUri)
                 try {
-                    $cert = Get-CertificateFromDomain -DomainName $domainName
+                    $cert = Invoke-WithRetry -Action { Get-CertificateFromDomain -DomainName $domainName } -OperationName "TLS probe for $domainName" -Category Tls -MaxAttempts $TlsRetryCount -BaseDelayMs $RetryBaseDelayMs
                     if ($cert) {
+                        $certDetails = Get-CertificateChainDetails -Certificate $cert
                         $expiryDate = $cert.NotAfter
-                        $subject = $cert.Subject
+                        $subject = $certDetails.Subject
+                        $issuer = $certDetails.Issuer
+                        $issuingCA = $certDetails.IssuingCA
+                        $serverCertificateCount = $certDetails.ServerCertificateCount
+                        $intermediateCA = $certDetails.IntermediateCA
+                        $rootCA = $certDetails.RootCA
+                        $chainStatus = $certDetails.ChainStatus
+                        $digiCertIssued = $certDetails.DigiCertIssued
                     }
                     
                     Write-Host " OK" -ForegroundColor Green
@@ -919,7 +1422,15 @@ function Get-FrontDoorCertificates {
                     Domain             = $domainName
                     CertificateType    = $certSource
                     ProvisioningState  = $provisioningState
+                    ValidationState    = $validationState
                     Subject            = $subject
+                    Issuer             = $issuer
+                    IssuingCA          = $issuingCA
+                    ServerCertificateCount = $serverCertificateCount
+                    IntermediateCA         = $intermediateCA
+                    RootCA                 = $rootCA
+                    ChainStatus            = $chainStatus
+                    DigiCertIssued         = $digiCertIssued
                     ExpirationDate     = $expiryDisplay
                     ExpirationStatus   = $expiryStatus
                     KeyVaultName       = $keyVaultName
@@ -944,7 +1455,9 @@ function Get-FrontDoorCertificates {
         # Get custom domains via REST API
         try {
             $pathDomains = "/subscriptions/$subscriptionId/resourceGroups/$rgName/providers/Microsoft.Cdn/profiles/$fdName/customDomains?api-version=$ApiVersion"
-            $domainsResp = Invoke-AzRest -Path $pathDomains -Method GET -ErrorAction Stop
+            $domainsResp = Invoke-WithRetry -Action {
+                Invoke-AzRest -Path $pathDomains -Method GET -ErrorAction Stop
+            } -OperationName "custom domains lookup for $fdName" -Category Rest -MaxAttempts $RestRetryCount -BaseDelayMs $RetryBaseDelayMs
             $domains = ($domainsResp.Content | ConvertFrom-Json).value
         }
         catch {
@@ -956,9 +1469,26 @@ function Get-FrontDoorCertificates {
             Write-Host "  No custom domains found for $fdName" -ForegroundColor Yellow
         }
         else {
-            Write-Host "  Found $($domains.Count) custom domain(s). Processing..."
+            $eligibleDomains = @(
+                $domains | Where-Object {
+                    $domainHostName = if ([string]::IsNullOrWhiteSpace([string]$_.properties.hostName)) { [string]$_.name } else { [string]$_.properties.hostName }
+                    -not (Test-IsDefaultAzureFrontDoorHostname -HostName $domainHostName)
+                }
+            )
+            $skippedDefaultDomains = @($domains).Count - $eligibleDomains.Count
 
-            foreach ($d in $domains) {
+            if ($skippedDefaultDomains -gt 0) {
+                Write-Host "  Skipping $skippedDefaultDomains default Azure Front Door endpoint(s)." -ForegroundColor Gray
+            }
+
+            if (-not $eligibleDomains -or $eligibleDomains.Count -eq 0) {
+                Write-Host "  No non-default custom domains found for $fdName" -ForegroundColor Yellow
+                return $results
+            }
+
+            Write-Host "  Found $($eligibleDomains.Count) custom domain(s). Processing..."
+
+            foreach ($d in $eligibleDomains) {
                 # Initialize fields
                 $certSource = $null
                 $provisioningState = $null
@@ -967,6 +1497,13 @@ function Get-FrontDoorCertificates {
                 $keyVaultSecretName = $null
                 $validationState = $null
                 $subject = $null
+                $issuer = $null
+                $issuingCA = $null
+                $serverCertificateCount = $null
+                $intermediateCA = $null
+                $rootCA = $null
+                $chainStatus = $null
+                $digiCertIssued = $null
                 
                 $domainName = $d.properties.hostName ?? $d.name
 
@@ -992,7 +1529,7 @@ function Get-FrontDoorCertificates {
                         try {
                             Write-Host "    Fetching certificate details for: $domainName..." -NoNewline
                             $secretPath = "$secretId`?api-version=$ApiVersion"
-                            $secretResp = Invoke-AzRest -Path $secretPath -Method GET -ErrorAction Stop
+                            $secretResp = Invoke-WithRetry -Action { Invoke-AzRest -Path $secretPath -Method GET -ErrorAction Stop } -OperationName "certificate secret lookup for $domainName" -Category Rest -MaxAttempts $RestRetryCount -BaseDelayMs $RetryBaseDelayMs
                             $secret = ($secretResp.Content | ConvertFrom-Json)
                             
                             if ($secret.properties -and $secret.properties.parameters) {
@@ -1004,6 +1541,12 @@ function Get-FrontDoorCertificates {
                                 if ($params.subject) {
                                     $subject = $params.subject
                                 }
+                                if ($params.certificateAuthority) {
+                                    $issuingCA = [string]$params.certificateAuthority
+                                }
+                                if ($params.issuer) {
+                                    $issuer = [string]$params.issuer
+                                }
                                 
                                 # For Customer Certificates, extract Key Vault details
                                 if ($params.type -eq 'CustomerCertificate' -and $params.secretSource -and $params.secretSource.id) {
@@ -1011,12 +1554,36 @@ function Get-FrontDoorCertificates {
                                     if ($kvSecretId -match '/vaults/([^/]+)/') { $keyVaultName = $matches[1] }
                                     if ($kvSecretId -match '/secrets/([^/]+)') { $keyVaultSecretName = $matches[1] }
                                 }
+
+                                $issuerDetails = Get-IssuerDetails -IssuerString $issuer -IssuingCAName $issuingCA
+                                $issuer = $issuerDetails.Issuer
+                                $issuingCA = $issuerDetails.IssuingCA
                             }
                             Write-Host " OK" -ForegroundColor Green
                         }
                         catch {
                             Write-Host " Failed" -ForegroundColor Yellow
                         }
+                    }
+                }
+
+                if ($domainName) {
+                    try {
+                        $liveCert = Invoke-WithRetry -Action { Get-CertificateFromDomain -DomainName $domainName } -OperationName "TLS probe for $domainName" -Category Tls -MaxAttempts $TlsRetryCount -BaseDelayMs $RetryBaseDelayMs
+                        if ($liveCert) {
+                            $certDetails = Get-CertificateChainDetails -Certificate $liveCert -IssuerString $issuer -IssuingCAName $issuingCA
+                            if (-not $subject) { $subject = $certDetails.Subject }
+                            if (-not $expiryDate) { $expiryDate = $liveCert.NotAfter }
+                            $issuer = $certDetails.Issuer
+                            $issuingCA = $certDetails.IssuingCA
+                            $serverCertificateCount = $certDetails.ServerCertificateCount
+                            $intermediateCA = $certDetails.IntermediateCA
+                            $rootCA = $certDetails.RootCA
+                            $chainStatus = $certDetails.ChainStatus
+                            $digiCertIssued = $certDetails.DigiCertIssued
+                        }
+                    }
+                    catch {
                     }
                 }
 
@@ -1035,6 +1602,13 @@ function Get-FrontDoorCertificates {
                     ProvisioningState  = $provisioningState
                     ValidationState    = $validationState
                     Subject            = $subject
+                    Issuer             = $issuer
+                    IssuingCA          = $issuingCA
+                    ServerCertificateCount = $serverCertificateCount
+                    IntermediateCA         = $intermediateCA
+                    RootCA                 = $rootCA
+                    ChainStatus            = $chainStatus
+                    DigiCertIssued         = $digiCertIssued
                     ExpirationDate     = $expiryDisplay
                     ExpirationStatus   = $expiryStatus
                     KeyVaultName       = $keyVaultName
@@ -1130,8 +1704,9 @@ elseif ($PSCmdlet.ParameterSetName -eq 'ScanTenant') {
     if ($allFrontDoors.Count -eq 0) {
         Write-Host "No Front Door profiles found in the tenant." -ForegroundColor Yellow
     } else {
-        # Step 4: Process Front Doors in parallel grouped by type
+        # ARM metadata calls and live TLS probes saturate different resources, so keep separate throttles.
         Write-Host "[4/4] Processing certificates (parallel=$ThrottleLimit)..." -ForegroundColor Cyan
+        $scanStartedAt = Get-Date
         
         $standardPremiumFDs = @($allFrontDoors | Where-Object { $_.Type -eq 'Standard/Premium' })
         $classicFDs = @($allFrontDoors | Where-Object { $_.Type -eq 'Classic' })
@@ -1148,27 +1723,429 @@ elseif ($PSCmdlet.ParameterSetName -eq 'ScanTenant') {
                 $apiVer = $using:ApiVersion
                 $subLookup = $using:subscriptionLookup
                 $warnDays = $using:WarningDays
-                
-                # Build ARM REST URI for this Front Door's custom domains
+                $scanAt = $using:scanStartedAt
+                $proxyUri = $using:ProxyUri
+                $tlsTimeoutMs = $using:TlsTimeoutMs
+                $restRetryCount = $using:RestRetryCount
+                $tlsRetryCount = $using:TlsRetryCount
+                $retryBaseDelayMs = $using:RetryBaseDelayMs
+
+                # Parallel runspaces do not inherit caller-defined helpers, so keep local copies here.
+
+                # Opens a live TLS session to the domain, optionally through the detected proxy.
+                function Get-CertificateFromDomainLocal {
+                    param(
+                        [Parameter(Mandatory)]
+                        [string]$DomainName,
+
+                        [Parameter(Mandatory = $false)]
+                        [Uri]$ProxyUri,
+
+                        [Parameter(Mandatory)]
+                        [int]$TimeoutMs
+                    )
+
+                    $tcpClient = $null
+                    $sslStream = $null
+                    $networkStream = $null
+                    $reader = $null
+                    $writer = $null
+
+                    try {
+                        $tcpClient = [System.Net.Sockets.TcpClient]::new()
+                        $tcpClient.SendTimeout = $TimeoutMs
+                        $tcpClient.ReceiveTimeout = $TimeoutMs
+
+                        if ($ProxyUri) {
+                            $tcpClient.Connect($ProxyUri.Host, $ProxyUri.Port)
+                            $networkStream = $tcpClient.GetStream()
+
+                            $writer = [System.IO.StreamWriter]::new($networkStream, [System.Text.Encoding]::ASCII)
+                            $writer.AutoFlush = $true
+                            $reader = [System.IO.StreamReader]::new($networkStream, [System.Text.Encoding]::ASCII)
+
+                            $writer.WriteLine("CONNECT ${DomainName}:443 HTTP/1.1")
+                            $writer.WriteLine("Host: ${DomainName}:443")
+                            $writer.WriteLine("")
+
+                            $response = $reader.ReadLine()
+                            if ($response -notmatch '^HTTP/\d\.\d 200') {
+                                throw "Proxy CONNECT failed: $response"
+                            }
+
+                            while ($true) {
+                                $line = $reader.ReadLine()
+                                if ([string]::IsNullOrEmpty($line)) { break }
+                            }
+
+                            $sslStream = [System.Net.Security.SslStream]::new(
+                                $networkStream,
+                                $false,
+                                { param($s, $certificate, $chain, $sslPolicyErrors) return $true }
+                            )
+                        }
+                        else {
+                            $tcpClient.Connect($DomainName, 443)
+                            $sslStream = [System.Net.Security.SslStream]::new(
+                                $tcpClient.GetStream(),
+                                $false,
+                                { param($s, $certificate, $chain, $sslPolicyErrors) return $true }
+                            )
+                        }
+
+                        $sslStream.AuthenticateAsClient($DomainName)
+                        $cert = $sslStream.RemoteCertificate
+                        if ($cert) {
+                            return [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($cert)
+                        }
+
+                        return $null
+                    }
+                    finally {
+                        if ($writer) { $writer.Dispose() }
+                        if ($reader) { $reader.Dispose() }
+                        if ($sslStream) { $sslStream.Dispose() }
+                        if ($tcpClient) { $tcpClient.Dispose() }
+                    }
+                }
+
+                # Normalizes issuer metadata into consistent Issuer and IssuingCA values.
+                function Get-IssuerDetailsLocal {
+                    param(
+                        [Parameter(Mandatory = $false)]
+                        [System.Security.Cryptography.X509Certificates.X509Certificate2]$Certificate,
+
+                        [Parameter(Mandatory = $false)]
+                        [string]$IssuerString,
+
+                        [Parameter(Mandatory = $false)]
+                        [string]$IssuingCAName
+                    )
+
+                    $issuer = $IssuerString
+                    if (-not $issuer -and $Certificate) {
+                        $issuer = $Certificate.Issuer
+                    }
+
+                    $issuingCA = $IssuingCAName
+                    if (-not $issuingCA -and $Certificate) {
+                        try {
+                            $issuingCA = $Certificate.GetNameInfo([System.Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $true)
+                        }
+                        catch {
+                            $issuingCA = $null
+                        }
+                    }
+
+                    if (-not $issuingCA -and $issuer) {
+                        if ($issuer -match '(^|,\s*)CN=([^,]+)') {
+                            $issuingCA = $matches[2].Trim()
+                        }
+                        elseif ($issuer -match '(^|,\s*)O=([^,]+)') {
+                            $issuingCA = $matches[2].Trim()
+                        }
+                        else {
+                            $issuingCA = $issuer
+                        }
+                    }
+
+                    return @{
+                        Issuer    = $issuer
+                        IssuingCA = $issuingCA
+                    }
+                }
+
+                # Pulls HTTP status codes out of nested REST exception shapes.
+                function Get-HttpStatusCodeFromExceptionLocal {
+                    param([AllowNull()][System.Exception]$Exception)
+
+                    if (-not $Exception) {
+                        return $null
+                    }
+
+                    foreach ($propertyName in 'StatusCode', 'Response') {
+                        $property = $Exception.PSObject.Properties[$propertyName]
+                        if (-not $property) {
+                            continue
+                        }
+
+                        try {
+                            if ($propertyName -eq 'StatusCode' -and $null -ne $property.Value) {
+                                return [int]$property.Value
+                            }
+
+                            if ($propertyName -eq 'Response' -and $property.Value -and $property.Value.StatusCode) {
+                                return [int]$property.Value.StatusCode
+                            }
+                        }
+                        catch {
+                        }
+                    }
+
+                    if ($Exception.InnerException -and $Exception.InnerException -ne $Exception) {
+                        return Get-HttpStatusCodeFromExceptionLocal -Exception $Exception.InnerException
+                    }
+
+                    return $null
+                }
+
+                # Identifies retryable REST failures for ARM and Resource Manager calls.
+                function Test-IsTransientRestFailureLocal {
+                    param([AllowNull()][System.Exception]$Exception)
+
+                    if (-not $Exception) {
+                        return $false
+                    }
+
+                    $statusCode = Get-HttpStatusCodeFromExceptionLocal -Exception $Exception
+                    if ($null -ne $statusCode) {
+                        return $statusCode -in 408, 409, 429, 500, 502, 503, 504
+                    }
+
+                    $message = $Exception.Message
+                    if ($Exception.InnerException -and $Exception.InnerException.Message) {
+                        $message = "{0} {1}" -f $message, $Exception.InnerException.Message
+                    }
+
+                    return $message -match 'timed out|timeout|temporar|throttl|too many requests|connection.+(reset|aborted|closed)|remote party closed|EOF|unexpected end'
+                }
+
+                # Identifies retryable TLS and proxy-connect failures during live probing.
+                function Test-IsTransientTlsFailureLocal {
+                    param([AllowNull()][System.Exception]$Exception, [string]$FailureMessage)
+
+                    $message = $FailureMessage
+                    if ($Exception -and $Exception.Message) {
+                        $message = if ($message) { "{0} {1}" -f $message, $Exception.Message } else { $Exception.Message }
+                    }
+                    if ($Exception -and $Exception.InnerException -and $Exception.InnerException.Message) {
+                        $message = if ($message) { "{0} {1}" -f $message, $Exception.InnerException.Message } else { $Exception.InnerException.Message }
+                    }
+
+                    return $message -match 'timed out|timeout|temporar|connection.+(reset|aborted|closed)|remote party closed|EOF|unexpected end|network.+unreachable|host.+unreachable|Proxy CONNECT failed: HTTP/\d\.\d (429|502|503|504)'
+                }
+
+                # Applies capped exponential backoff between retry attempts.
+                function Get-RetryDelayMillisecondsLocal {
+                    param([int]$Attempt, [int]$BaseDelayMs)
+                    return [int][Math]::Min([Math]::Round($BaseDelayMs * [Math]::Pow(2, [Math]::Max($Attempt - 1, 0))), 10000)
+                }
+
+                # Retries transient REST or TLS failures inside the runspace.
+                function Invoke-WithRetryLocal {
+                    param(
+                        [Parameter(Mandatory)]
+                        [scriptblock]$Action,
+
+                        [Parameter(Mandatory)]
+                        [ValidateSet('Rest', 'Tls')]
+                        [string]$Category,
+
+                        [Parameter(Mandatory)]
+                        [int]$MaxAttempts,
+
+                        [Parameter(Mandatory)]
+                        [int]$BaseDelayMs
+                    )
+
+                    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+                        try {
+                            return & $Action
+                        }
+                        catch {
+                            $exception = $_.Exception
+                            $isTransient = if ($Category -eq 'Rest') {
+                                Test-IsTransientRestFailureLocal -Exception $exception
+                            }
+                            else {
+                                Test-IsTransientTlsFailureLocal -Exception $exception -FailureMessage $exception.Message
+                            }
+
+                            if (-not $isTransient -or $attempt -ge $MaxAttempts) {
+                                throw
+                            }
+
+                            Start-Sleep -Milliseconds (Get-RetryDelayMillisecondsLocal -Attempt $attempt -BaseDelayMs $BaseDelayMs)
+                        }
+                    }
+                }
+
+                # Builds a readable display name from a certificate subject or issuer DN.
+                function Get-CertificateDisplayNameLocal {
+                    param([System.Security.Cryptography.X509Certificates.X509Certificate2]$Certificate, [string]$DistinguishedName)
+
+                    $displayName = $null
+                    if ($Certificate) {
+                        try {
+                            $displayName = $Certificate.GetNameInfo([System.Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false)
+                        }
+                        catch {
+                            $displayName = $null
+                        }
+
+                        if (-not $DistinguishedName) {
+                            $DistinguishedName = $Certificate.Subject
+                        }
+                    }
+
+                    if (-not $displayName -and $DistinguishedName) {
+                        if ($DistinguishedName -match '(^|,\s*)CN=([^,]+)') {
+                            $displayName = $matches[2].Trim()
+                        }
+                        elseif ($DistinguishedName -match '(^|,\s*)O=([^,]+)') {
+                            $displayName = $matches[2].Trim()
+                        }
+                        else {
+                            $displayName = $DistinguishedName
+                        }
+                    }
+
+                    return $displayName
+                }
+
+                # Summarizes non-success statuses produced by X509 chain building.
+                function Get-ChainStatusSummaryLocal {
+                    param([System.Security.Cryptography.X509Certificates.X509Chain]$Chain)
+
+                    if (-not $Chain) {
+                        return $null
+                    }
+
+                    $statuses = @(
+                        $Chain.ChainStatus |
+                            Where-Object { $_.Status -ne [System.Security.Cryptography.X509Certificates.X509ChainStatusFlags]::NoError } |
+                            ForEach-Object { [string]$_.Status } |
+                            Select-Object -Unique
+                    )
+
+                    if (-not $statuses -or $statuses.Count -eq 0) {
+                        return 'Valid'
+                    }
+
+                    return ($statuses -join ',')
+                }
+
+                # Builds certificate-chain metadata from the live certificate presented by the endpoint.
+                function Get-CertificateChainDetailsLocal {
+                    param(
+                        [System.Security.Cryptography.X509Certificates.X509Certificate2]$Certificate,
+                        [string]$IssuerString,
+                        [string]$IssuingCAName
+                    )
+
+                    if (-not $Certificate) {
+                        return @{
+                            Subject                = $null
+                            Issuer                 = $IssuerString
+                            IssuingCA              = $IssuingCAName
+                            ServerCertificateCount = $null
+                            IntermediateCA         = $null
+                            RootCA                 = $null
+                            ChainStatus            = $null
+                            DigiCertIssued         = $null
+                        }
+                    }
+
+                    $issuerDetails = Get-IssuerDetailsLocal -Certificate $Certificate -IssuerString $IssuerString -IssuingCAName $IssuingCAName
+                    $serverCertificateCount = 1
+                    $intermediateCA = $null
+                    $rootCA = $null
+                    $chainStatus = $null
+                    $digiCertIssued = $false
+                    $chain = [System.Security.Cryptography.X509Certificates.X509Chain]::new()
+
+                    try {
+                        # Avoid revocation lookups during inventory scans so live probing stays fast and predictable.
+                        $chain.ChainPolicy.RevocationMode = [System.Security.Cryptography.X509Certificates.X509RevocationMode]::NoCheck
+                        $chain.ChainPolicy.RevocationFlag = [System.Security.Cryptography.X509Certificates.X509RevocationFlag]::ExcludeRoot
+                        $chain.ChainPolicy.VerificationFlags = [System.Security.Cryptography.X509Certificates.X509VerificationFlags]::NoFlag
+                        $null = $chain.Build($Certificate)
+
+                        $chainElements = @($chain.ChainElements)
+                        if ($chainElements.Count -gt 0) {
+                            $serverCertificateCount = $chainElements.Count
+                            $chainStatus = Get-ChainStatusSummaryLocal -Chain $chain
+                            $lastElementCertificate = $chainElements[$chainElements.Count - 1].Certificate
+                            $lastIsSelfSigned = $lastElementCertificate -and ($lastElementCertificate.Subject -eq $lastElementCertificate.Issuer)
+
+                            $intermediateCertificates = @()
+                            # Treat a self-signed last element as the root and everything between as intermediates.
+                            if ($chainElements.Count -ge 3 -or $lastIsSelfSigned) {
+                                $rootCA = Get-CertificateDisplayNameLocal -Certificate $lastElementCertificate
+                                if ($chainElements.Count -gt 2) {
+                                    $intermediateCertificates = @($chainElements[1..($chainElements.Count - 2)] | ForEach-Object { $_.Certificate })
+                                }
+                            }
+                            elseif ($chainElements.Count -gt 1) {
+                                $intermediateCertificates = @($chainElements[1..($chainElements.Count - 1)] | ForEach-Object { $_.Certificate })
+                            }
+
+                            $intermediateNames = @(
+                                $intermediateCertificates |
+                                    ForEach-Object { Get-CertificateDisplayNameLocal -Certificate $_ } |
+                                    Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+                                    Select-Object -Unique
+                            )
+                            if ($intermediateNames.Count -gt 0) {
+                                $intermediateCA = $intermediateNames -join ' | '
+                            }
+                        }
+                    }
+                    finally {
+                        $chain.Dispose()
+                    }
+
+                    if ($issuerDetails.Issuer -match '\bDigiCert\b' -or $issuerDetails.IssuingCA -match '\bDigiCert\b' -or $intermediateCA -match '\bDigiCert\b' -or $rootCA -match '\bDigiCert\b') {
+                        $digiCertIssued = $true
+                    }
+
+                    return @{
+                        Subject                = $Certificate.Subject
+                        Issuer                 = $issuerDetails.Issuer
+                        IssuingCA              = $issuerDetails.IssuingCA
+                        ServerCertificateCount = $serverCertificateCount
+                        IntermediateCA         = $intermediateCA
+                        RootCA                 = $rootCA
+                        ChainStatus            = $chainStatus
+                        DigiCertIssued         = $digiCertIssued
+                    }
+                }
+
+                # Query the Front Door custom-domain child resources directly so we can stay parallel.
                 $baseUri = "https://management.azure.com/subscriptions/$($fd.SubscriptionId)/resourceGroups/$($fd.ResourceGroupName)/providers/Microsoft.Cdn/profiles/$($fd.Name)"
-                
+
                 try {
                     # Get custom domains
                     $domainsUri = "$baseUri/customDomains?api-version=$apiVer"
-                    $domainsResp = Invoke-RestMethod -Method Get -Uri $domainsUri -Headers $hdrs -ErrorAction Stop
+                    $domainsResp = Invoke-WithRetryLocal -Action {
+                        Invoke-RestMethod -Method Get -Uri $domainsUri -Headers $hdrs -ErrorAction Stop
+                    } -Category Rest -MaxAttempts $restRetryCount -BaseDelayMs $retryBaseDelayMs
                     $domains = @($domainsResp.value)
-                    
+                    $includedDomainCount = 0
+
                     foreach ($d in $domains) {
                         $domainName = $d.properties.hostName ?? $d.name
+                        if (-not [string]::IsNullOrWhiteSpace($domainName) -and $domainName.EndsWith('.azurefd.net', [System.StringComparison]::OrdinalIgnoreCase)) {
+                            continue
+                        }
+
+                        $includedDomainCount++
                         $certSource = $null
                         $provisioningState = $d.properties.provisioningState
                         $validationState = $d.properties.domainValidationState
                         $expiryDate = $null
                         $subject = $null
+                        $issuer = $null
+                        $issuingCA = $null
+                        $serverCertificateCount = $null
+                        $intermediateCA = $null
+                        $rootCA = $null
+                        $chainStatus = $null
+                        $digiCertIssued = $null
                         $keyVaultName = $null
                         $keyVaultSecretName = $null
                         
-                        # Get TLS settings
+                        # Prefer certificate metadata from ARM, then enrich it with a live TLS probe when available.
                         if ($d.properties.tlsSettings) {
                             $tls = $d.properties.tlsSettings
                             $certSource = switch ($tls.certificateType) {
@@ -1177,23 +2154,52 @@ elseif ($PSCmdlet.ParameterSetName -eq 'ScanTenant') {
                                 default { $tls.certificateType }
                             }
                             
-                            # Fetch certificate details from secret
                             if ($tls.secret -and $tls.secret.id) {
                                 $secretUri = "https://management.azure.com$($tls.secret.id)?api-version=$apiVer"
                                 try {
-                                    $secret = Invoke-RestMethod -Method Get -Uri $secretUri -Headers $hdrs -ErrorAction Stop
+                                    $secret = Invoke-WithRetryLocal -Action {
+                                        Invoke-RestMethod -Method Get -Uri $secretUri -Headers $hdrs -ErrorAction Stop
+                                    } -Category Rest -MaxAttempts $restRetryCount -BaseDelayMs $retryBaseDelayMs
                                     if ($secret.properties -and $secret.properties.parameters) {
                                         $params = $secret.properties.parameters
                                         if ($params.expirationDate) { $expiryDate = $params.expirationDate }
                                         if ($params.subject) { $subject = $params.subject }
+                                        if ($params.certificateAuthority) { $issuingCA = [string]$params.certificateAuthority }
+                                        if ($params.issuer) { $issuer = [string]$params.issuer }
                                         
                                         if ($params.type -eq 'CustomerCertificate' -and $params.secretSource -and $params.secretSource.id) {
                                             $kvSecretId = $params.secretSource.id
                                             if ($kvSecretId -match '/vaults/([^/]+)/') { $keyVaultName = $Matches[1] }
                                             if ($kvSecretId -match '/secrets/([^/]+)') { $keyVaultSecretName = $Matches[1] }
                                         }
+
+                                        $issuerDetails = Get-IssuerDetailsLocal -IssuerString $issuer -IssuingCAName $issuingCA
+                                        $issuer = $issuerDetails.Issuer
+                                        $issuingCA = $issuerDetails.IssuingCA
                                     }
                                 } catch { }
+                            }
+                        }
+
+                        if ($domainName) {
+                            try {
+                                $liveCert = Invoke-WithRetryLocal -Action {
+                                    Get-CertificateFromDomainLocal -DomainName $domainName -ProxyUri $proxyUri -TimeoutMs $tlsTimeoutMs
+                                } -Category Tls -MaxAttempts $tlsRetryCount -BaseDelayMs $retryBaseDelayMs
+                                if ($liveCert) {
+                                    $certDetails = Get-CertificateChainDetailsLocal -Certificate $liveCert -IssuerString $issuer -IssuingCAName $issuingCA
+                                    if (-not $subject) { $subject = $certDetails.Subject }
+                                    if (-not $expiryDate) { $expiryDate = $liveCert.NotAfter }
+                                    $issuer = $certDetails.Issuer
+                                    $issuingCA = $certDetails.IssuingCA
+                                    $serverCertificateCount = $certDetails.ServerCertificateCount
+                                    $intermediateCA = $certDetails.IntermediateCA
+                                    $rootCA = $certDetails.RootCA
+                                    $chainStatus = $certDetails.ChainStatus
+                                    $digiCertIssued = $certDetails.DigiCertIssued
+                                }
+                            }
+                            catch {
                             }
                         }
                         
@@ -1204,7 +2210,7 @@ elseif ($PSCmdlet.ParameterSetName -eq 'ScanTenant') {
                             try {
                                 $expiryDateTime = if ($expiryDate -is [DateTime]) { $expiryDate } else { [DateTime]::Parse($expiryDate) }
                                 $expiryDisplay = $expiryDateTime.ToString()
-                                $daysUntilExpiry = ($expiryDateTime - (Get-Date)).Days
+                                $daysUntilExpiry = ($expiryDateTime - $scanAt).Days
                                 $expiryStatus = if ($daysUntilExpiry -lt 0) { 'EXPIRED' } elseif ($daysUntilExpiry -le $warnDays) { 'WARNING' } else { 'OK' }
                             } catch { $expiryDisplay = $expiryDate }
                         }
@@ -1219,6 +2225,13 @@ elseif ($PSCmdlet.ParameterSetName -eq 'ScanTenant') {
                             ProvisioningState  = $provisioningState
                             ValidationState    = $validationState
                             Subject            = $subject
+                            Issuer             = $issuer
+                            IssuingCA          = $issuingCA
+                            ServerCertificateCount = $serverCertificateCount
+                            IntermediateCA         = $intermediateCA
+                            RootCA                 = $rootCA
+                            ChainStatus            = $chainStatus
+                            DigiCertIssued         = $digiCertIssued
                             ExpirationDate     = $expiryDisplay
                             ExpirationStatus   = $expiryStatus
                             KeyVaultName       = $keyVaultName
@@ -1227,7 +2240,7 @@ elseif ($PSCmdlet.ParameterSetName -eq 'ScanTenant') {
                     }
                     
                     # Progress marker
-                    [PSCustomObject]@{ __Progress = $true; FrontDoorName = $fd.Name; DomainCount = $domains.Count }
+                    [PSCustomObject]@{ __Progress = $true; FrontDoorName = $fd.Name; DomainCount = $includedDomainCount }
                 } catch {
                     [PSCustomObject]@{ __Progress = $true; FrontDoorName = $fd.Name; DomainCount = 0; Error = $_.Exception.Message }
                 }
@@ -1245,53 +2258,181 @@ elseif ($PSCmdlet.ParameterSetName -eq 'ScanTenant') {
             Write-Host "    Completed Standard/Premium processing." -ForegroundColor Green
         }
         
-        # Process Classic Front Doors with parallel TLS probing
+        # Process Classic Front Doors via ARM REST and parallel TLS probing
         if ($classicFDs.Count -gt 0) {
             Write-Host "  Processing $($classicFDs.Count) Classic Front Door(s)..." -ForegroundColor Cyan
-            
-            # First, enumerate all Classic FD endpoints (requires Az context switching, done sequentially)
             $classicEndpoints = [System.Collections.Generic.List[PSCustomObject]]::new()
-            
-            # Group by subscription to minimize context switches
-            $classicBySubscription = $classicFDs | Group-Object SubscriptionId
-            $subIndex = 0
-            $totalSubs = $classicBySubscription.Count
+            $classicProgressInterval = Get-ProgressInterval -TotalCount $classicFDs.Count
             $classicFDsProcessed = 0
-            
-            Write-Host "    Enumerating endpoints across $totalSubs subscription(s)..." -ForegroundColor Cyan
-            
-            foreach ($subGroup in $classicBySubscription) {
-                $subIndex++
-                try {
-                    $null = Set-AzContext -Subscription $subGroup.Name -ErrorAction Stop
-                    $ctx = Get-AzContext
-                    $subName = $ctx.Subscription.Name
-                    $fdsInSub = $subGroup.Group.Count
-                    
-                    foreach ($fd in $subGroup.Group) {
-                        $classicFDsProcessed++
+
+            Write-Host "    Enumerating endpoints via ARM REST in parallel (parallel=$ThrottleLimit)..." -ForegroundColor Cyan
+
+            $classicFDs | ForEach-Object -ThrottleLimit $ThrottleLimit -Parallel {
+                $fd = $_
+                $hdrs = $using:Headers
+                $apiVer = $using:ClassicApiVersion
+                $subLookup = $using:subscriptionLookup
+                $restRetryCount = $using:RestRetryCount
+                $retryBaseDelayMs = $using:RetryBaseDelayMs
+
+                # Pulls HTTP status codes out of nested REST exception shapes.
+                function Get-HttpStatusCodeFromExceptionLocal {
+                    param([AllowNull()][System.Exception]$Exception)
+
+                    if (-not $Exception) {
+                        return $null
+                    }
+
+                    foreach ($propertyName in 'StatusCode', 'Response') {
+                        $property = $Exception.PSObject.Properties[$propertyName]
+                        if (-not $property) {
+                            continue
+                        }
+
                         try {
-                            $endpoints = Get-AzFrontDoorFrontendEndpoint -FrontDoorName $fd.Name -ResourceGroupName $fd.ResourceGroupName -ErrorAction Stop
-                            foreach ($ep in $endpoints) {
-                                $classicEndpoints.Add([PSCustomObject]@{
-                                    SubscriptionId     = $ctx.Subscription.Id
-                                    SubscriptionName   = $ctx.Subscription.Name
-                                    FrontDoorName      = $fd.Name
-                                    ResourceGroupName  = $fd.ResourceGroupName
-                                    HostName           = $ep.HostName ?? $ep.Name
-                                    CertificateSource  = $ep.CertificateSource
-                                    ProvisioningState  = $ep.CustomHttpsProvisioningState
-                                    KeyVaultName       = if ($ep.Vault) { ($ep.Vault -split '/')[-1] } else { $null }
-                                    KeyVaultSecretName = $ep.SecretName
-                                })
+                            if ($propertyName -eq 'StatusCode' -and $null -ne $property.Value) {
+                                return [int]$property.Value
                             }
-                        } catch {
-                            Write-Host "      Warning: Failed to get endpoints for $($fd.Name): $($_.Exception.Message)" -ForegroundColor Yellow
+
+                            if ($propertyName -eq 'Response' -and $property.Value -and $property.Value.StatusCode) {
+                                return [int]$property.Value.StatusCode
+                            }
+                        }
+                        catch {
                         }
                     }
-                    Write-Host "      [$subIndex/$totalSubs] $subName : $fdsInSub FD(s), $($classicEndpoints.Count) endpoint(s) total" -ForegroundColor DarkGray
+
+                    if ($Exception.InnerException -and $Exception.InnerException -ne $Exception) {
+                        return Get-HttpStatusCodeFromExceptionLocal -Exception $Exception.InnerException
+                    }
+
+                    return $null
+                }
+
+                # Identifies retryable REST failures during Classic endpoint discovery.
+                function Test-IsTransientRestFailureLocal {
+                    param([AllowNull()][System.Exception]$Exception)
+
+                    if (-not $Exception) {
+                        return $false
+                    }
+
+                    $statusCode = Get-HttpStatusCodeFromExceptionLocal -Exception $Exception
+                    if ($null -ne $statusCode) {
+                        return $statusCode -in 408, 409, 429, 500, 502, 503, 504
+                    }
+
+                    $message = $Exception.Message
+                    if ($Exception.InnerException -and $Exception.InnerException.Message) {
+                        $message = "{0} {1}" -f $message, $Exception.InnerException.Message
+                    }
+
+                    return $message -match 'timed out|timeout|temporar|throttl|too many requests|connection.+(reset|aborted|closed)|remote party closed|EOF|unexpected end'
+                }
+
+                # Applies capped exponential backoff between retry attempts.
+                function Get-RetryDelayMillisecondsLocal {
+                    param([int]$Attempt, [int]$BaseDelayMs)
+                    return [int][Math]::Min([Math]::Round($BaseDelayMs * [Math]::Pow(2, [Math]::Max($Attempt - 1, 0))), 10000)
+                }
+
+                # Retries transient REST failures while enumerating Classic endpoint metadata.
+                function Invoke-WithRetryLocal {
+                    param([Parameter(Mandatory)][scriptblock]$Action, [Parameter(Mandatory)][int]$MaxAttempts, [Parameter(Mandatory)][int]$BaseDelayMs)
+
+                    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+                        try {
+                            return & $Action
+                        }
+                        catch {
+                            if (-not (Test-IsTransientRestFailureLocal -Exception $_.Exception) -or $attempt -ge $MaxAttempts) {
+                                throw
+                            }
+
+                            Start-Sleep -Milliseconds (Get-RetryDelayMillisecondsLocal -Attempt $attempt -BaseDelayMs $BaseDelayMs)
+                        }
+                    }
+                }
+
+                try {
+                    # Retrieve the full Front Door resource once and fan out over frontend endpoints locally.
+                    $uri = "https://management.azure.com/subscriptions/$($fd.SubscriptionId)/resourceGroups/$($fd.ResourceGroupName)/providers/Microsoft.Network/frontDoors/$($fd.Name)?api-version=$apiVer"
+                    $frontDoor = Invoke-WithRetryLocal -Action {
+                        Invoke-RestMethod -Method Get -Uri $uri -Headers $hdrs -ErrorAction Stop
+                    } -MaxAttempts $restRetryCount -BaseDelayMs $retryBaseDelayMs
+                    $endpointCount = 0
+
+                    foreach ($ep in @($frontDoor.properties.frontendEndpoints)) {
+                        $hostName = if ([string]::IsNullOrWhiteSpace([string]$ep.properties.hostName)) { [string]$ep.name } else { [string]$ep.properties.hostName }
+                        if ([string]::IsNullOrWhiteSpace($hostName)) {
+                            continue
+                        }
+                        if ($hostName.EndsWith('.azurefd.net', [System.StringComparison]::OrdinalIgnoreCase)) {
+                            continue
+                        }
+
+                        $customHttpsConfig = $ep.properties.customHttpsConfiguration
+                        $certificateSource = $null
+                        $keyVaultName = $null
+                        $keyVaultSecretName = $null
+
+                        if ($customHttpsConfig) {
+                            if ($customHttpsConfig.certificateSource) {
+                                $certificateSource = [string]$customHttpsConfig.certificateSource
+                            }
+
+                            $vaultIdCandidates = @(
+                                $customHttpsConfig.vault.id,
+                                $customHttpsConfig.vault,
+                                $customHttpsConfig.keyVaultCertificateSourceParameters.vault.id,
+                                $customHttpsConfig.keyVaultCertificateSourceParameters.vault,
+                                $customHttpsConfig.secretSource.id,
+                                $customHttpsConfig.secretSource
+                            ) | Where-Object { $_ }
+
+                            $vaultId = @($vaultIdCandidates | Select-Object -First 1)[0]
+                            if ($vaultId -and ($vaultId -match '/vaults/([^/]+)/')) {
+                                $keyVaultName = $Matches[1]
+                            }
+
+                            $secretNameCandidates = @(
+                                $customHttpsConfig.secretName,
+                                $customHttpsConfig.keyVaultCertificateSourceParameters.secretName,
+                                $customHttpsConfig.secretSource.secretName
+                            ) | Where-Object { $_ }
+
+                            $keyVaultSecretName = @($secretNameCandidates | Select-Object -First 1)[0]
+                            if (-not $keyVaultSecretName -and $vaultId -and ($vaultId -match '/secrets/([^/]+)')) {
+                                $keyVaultSecretName = $Matches[1]
+                            }
+                        }
+
+                        $endpointCount++
+                        [PSCustomObject]@{
+                            SubscriptionId     = $fd.SubscriptionId
+                            SubscriptionName   = $subLookup[$fd.SubscriptionId] ?? $fd.SubscriptionId
+                            FrontDoorName      = $fd.Name
+                            HostName           = $hostName
+                            CertificateSource  = $certificateSource
+                            ProvisioningState  = [string]$ep.properties.customHttpsProvisioningState
+                            KeyVaultName       = $keyVaultName
+                            KeyVaultSecretName = $keyVaultSecretName
+                        }
+                    }
+
+                    [PSCustomObject]@{ __Progress = $true; FrontDoorName = $fd.Name; EndpointCount = $endpointCount }
                 } catch {
-                    Write-Host "      [$subIndex/$totalSubs] Warning: Failed to switch to subscription $($subGroup.Name): $($_.Exception.Message)" -ForegroundColor Yellow
+                    [PSCustomObject]@{ __Progress = $true; FrontDoorName = $fd.Name; EndpointCount = 0; Error = $_.Exception.Message }
+                }
+            } | ForEach-Object {
+                if ($_.PSObject.Properties['__Progress']) {
+                    $classicFDsProcessed++
+                    if (($classicFDsProcessed % $classicProgressInterval -eq 0) -or ($classicFDsProcessed -eq $classicFDs.Count)) {
+                        $errMsg = if ($_.Error) { " (Error: $($_.Error))" } else { "" }
+                        Write-Host "    Enumerated $classicFDsProcessed/$($classicFDs.Count): $($_.FrontDoorName) -> $($_.EndpointCount) endpoint(s)$errMsg" -ForegroundColor DarkGray
+                    }
+                } else {
+                    $classicEndpoints.Add($_)
                 }
             }
             
@@ -1310,67 +2451,332 @@ elseif ($PSCmdlet.ParameterSetName -eq 'ScanTenant') {
                     $proxy = $using:proxyUri
                     $timeout = $using:tlsTimeout
                     $warnDays = $using:WarningDays
+                    $scanAt = $using:scanStartedAt
+                    $tlsRetryCount = $using:TlsRetryCount
+                    $retryBaseDelayMs = $using:RetryBaseDelayMs
+
+                    # Normalizes issuer metadata into consistent Issuer and IssuingCA values.
+                    function Get-IssuerDetailsLocal {
+                        param(
+                            [Parameter(Mandatory = $false)]
+                            [System.Security.Cryptography.X509Certificates.X509Certificate2]$Certificate,
+
+                            [Parameter(Mandatory = $false)]
+                            [string]$IssuerString,
+
+                            [Parameter(Mandatory = $false)]
+                            [string]$IssuingCAName
+                        )
+
+                        $issuer = $IssuerString
+                        if (-not $issuer -and $Certificate) {
+                            $issuer = $Certificate.Issuer
+                        }
+
+                        $issuingCA = $IssuingCAName
+                        if (-not $issuingCA -and $Certificate) {
+                            try {
+                                $issuingCA = $Certificate.GetNameInfo([System.Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $true)
+                            }
+                            catch {
+                                $issuingCA = $null
+                            }
+                        }
+
+                        if (-not $issuingCA -and $issuer) {
+                            if ($issuer -match '(^|,\s*)CN=([^,]+)') {
+                                $issuingCA = $matches[2].Trim()
+                            }
+                            elseif ($issuer -match '(^|,\s*)O=([^,]+)') {
+                                $issuingCA = $matches[2].Trim()
+                            }
+                            else {
+                                $issuingCA = $issuer
+                            }
+                        }
+
+                        return @{
+                            Issuer    = $issuer
+                            IssuingCA = $issuingCA
+                        }
+                    }
+
+                    # Identifies retryable TLS and proxy-connect failures during live probing.
+                    function Test-IsTransientTlsFailureLocal {
+                        param([AllowNull()][System.Exception]$Exception, [string]$FailureMessage)
+
+                        $message = $FailureMessage
+                        if ($Exception -and $Exception.Message) {
+                            $message = if ($message) { "{0} {1}" -f $message, $Exception.Message } else { $Exception.Message }
+                        }
+                        if ($Exception -and $Exception.InnerException -and $Exception.InnerException.Message) {
+                            $message = if ($message) { "{0} {1}" -f $message, $Exception.InnerException.Message } else { $Exception.InnerException.Message }
+                        }
+
+                        return $message -match 'timed out|timeout|temporar|connection.+(reset|aborted|closed)|remote party closed|EOF|unexpected end|network.+unreachable|host.+unreachable|Proxy CONNECT failed: HTTP/\d\.\d (429|502|503|504)'
+                    }
+
+                    # Applies capped exponential backoff between retry attempts.
+                    function Get-RetryDelayMillisecondsLocal {
+                        param([int]$Attempt, [int]$BaseDelayMs)
+                        return [int][Math]::Min([Math]::Round($BaseDelayMs * [Math]::Pow(2, [Math]::Max($Attempt - 1, 0))), 10000)
+                    }
+
+                    # Retries transient TLS failures inside the runspace.
+                    function Invoke-WithRetryLocal {
+                        param([Parameter(Mandatory)][scriptblock]$Action, [Parameter(Mandatory)][int]$MaxAttempts, [Parameter(Mandatory)][int]$BaseDelayMs)
+
+                        for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+                            try {
+                                return & $Action
+                            }
+                            catch {
+                                if (-not (Test-IsTransientTlsFailureLocal -Exception $_.Exception -FailureMessage $_.Exception.Message) -or $attempt -ge $MaxAttempts) {
+                                    throw
+                                }
+
+                                Start-Sleep -Milliseconds (Get-RetryDelayMillisecondsLocal -Attempt $attempt -BaseDelayMs $BaseDelayMs)
+                            }
+                        }
+                    }
+
+                    # Builds a readable display name from a certificate subject or issuer DN.
+                    function Get-CertificateDisplayNameLocal {
+                        param([System.Security.Cryptography.X509Certificates.X509Certificate2]$Certificate, [string]$DistinguishedName)
+
+                        $displayName = $null
+                        if ($Certificate) {
+                            try {
+                                $displayName = $Certificate.GetNameInfo([System.Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false)
+                            }
+                            catch {
+                                $displayName = $null
+                            }
+
+                            if (-not $DistinguishedName) {
+                                $DistinguishedName = $Certificate.Subject
+                            }
+                        }
+
+                        if (-not $displayName -and $DistinguishedName) {
+                            if ($DistinguishedName -match '(^|,\s*)CN=([^,]+)') {
+                                $displayName = $matches[2].Trim()
+                            }
+                            elseif ($DistinguishedName -match '(^|,\s*)O=([^,]+)') {
+                                $displayName = $matches[2].Trim()
+                            }
+                            else {
+                                $displayName = $DistinguishedName
+                            }
+                        }
+
+                        return $displayName
+                    }
+
+                    # Summarizes non-success statuses produced by X509 chain building.
+                    function Get-ChainStatusSummaryLocal {
+                        param([System.Security.Cryptography.X509Certificates.X509Chain]$Chain)
+
+                        if (-not $Chain) {
+                            return $null
+                        }
+
+                        $statuses = @(
+                            $Chain.ChainStatus |
+                                Where-Object { $_.Status -ne [System.Security.Cryptography.X509Certificates.X509ChainStatusFlags]::NoError } |
+                                ForEach-Object { [string]$_.Status } |
+                                Select-Object -Unique
+                        )
+
+                        if (-not $statuses -or $statuses.Count -eq 0) {
+                            return 'Valid'
+                        }
+
+                        return ($statuses -join ',')
+                    }
+
+                    # Builds certificate-chain metadata from the live certificate presented by the endpoint.
+                    function Get-CertificateChainDetailsLocal {
+                        param([System.Security.Cryptography.X509Certificates.X509Certificate2]$Certificate)
+
+                        if (-not $Certificate) {
+                            return @{
+                                Subject                = $null
+                                Issuer                 = $null
+                                IssuingCA              = $null
+                                ServerCertificateCount = $null
+                                IntermediateCA         = $null
+                                RootCA                 = $null
+                                ChainStatus            = $null
+                                DigiCertIssued         = $null
+                            }
+                        }
+
+                        $issuerDetails = Get-IssuerDetailsLocal -Certificate $Certificate
+                        $serverCertificateCount = 1
+                        $intermediateCA = $null
+                        $rootCA = $null
+                        $chainStatus = $null
+                        $digiCertIssued = $false
+                        $chain = [System.Security.Cryptography.X509Certificates.X509Chain]::new()
+
+                        try {
+                            # Avoid revocation lookups during inventory scans so live probing stays fast and predictable.
+                            $chain.ChainPolicy.RevocationMode = [System.Security.Cryptography.X509Certificates.X509RevocationMode]::NoCheck
+                            $chain.ChainPolicy.RevocationFlag = [System.Security.Cryptography.X509Certificates.X509RevocationFlag]::ExcludeRoot
+                            $chain.ChainPolicy.VerificationFlags = [System.Security.Cryptography.X509Certificates.X509VerificationFlags]::NoFlag
+                            $null = $chain.Build($Certificate)
+
+                            $chainElements = @($chain.ChainElements)
+                            if ($chainElements.Count -gt 0) {
+                                $serverCertificateCount = $chainElements.Count
+                                $chainStatus = Get-ChainStatusSummaryLocal -Chain $chain
+                                $lastElementCertificate = $chainElements[$chainElements.Count - 1].Certificate
+                                $lastIsSelfSigned = $lastElementCertificate -and ($lastElementCertificate.Subject -eq $lastElementCertificate.Issuer)
+
+                                $intermediateCertificates = @()
+                                # Treat a self-signed last element as the root and everything between as intermediates.
+                                if ($chainElements.Count -ge 3 -or $lastIsSelfSigned) {
+                                    $rootCA = Get-CertificateDisplayNameLocal -Certificate $lastElementCertificate
+                                    if ($chainElements.Count -gt 2) {
+                                        $intermediateCertificates = @($chainElements[1..($chainElements.Count - 2)] | ForEach-Object { $_.Certificate })
+                                    }
+                                }
+                                elseif ($chainElements.Count -gt 1) {
+                                    $intermediateCertificates = @($chainElements[1..($chainElements.Count - 1)] | ForEach-Object { $_.Certificate })
+                                }
+
+                                $intermediateNames = @(
+                                    $intermediateCertificates |
+                                        ForEach-Object { Get-CertificateDisplayNameLocal -Certificate $_ } |
+                                        Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+                                        Select-Object -Unique
+                                )
+                                if ($intermediateNames.Count -gt 0) {
+                                    $intermediateCA = $intermediateNames -join ' | '
+                                }
+                            }
+                        }
+                        finally {
+                            $chain.Dispose()
+                        }
+
+                        if ($issuerDetails.Issuer -match '\bDigiCert\b' -or $issuerDetails.IssuingCA -match '\bDigiCert\b' -or $intermediateCA -match '\bDigiCert\b' -or $rootCA -match '\bDigiCert\b') {
+                            $digiCertIssued = $true
+                        }
+
+                        return @{
+                            Subject                = $Certificate.Subject
+                            Issuer                 = $issuerDetails.Issuer
+                            IssuingCA              = $issuerDetails.IssuingCA
+                            ServerCertificateCount = $serverCertificateCount
+                            IntermediateCA         = $intermediateCA
+                            RootCA                 = $rootCA
+                            ChainStatus            = $chainStatus
+                            DigiCertIssued         = $digiCertIssued
+                        }
+                    }
                     
                     $expiryDate = $null
                     $subject = $null
-                    $errorMsg = $null
+                    $issuer = $null
+                    $issuingCA = $null
+                    $serverCertificateCount = $null
+                    $intermediateCA = $null
+                    $rootCA = $null
+                    $chainStatus = $null
+                    $digiCertIssued = $null
+                    $probeResult = $null
                     
-                    # Inline TLS certificate fetching (functions don't inherit in parallel runspaces)
+                    # Inline the TLS probe so each runspace can own and dispose its own socket state.
                     try {
-                        $tcpClient = [System.Net.Sockets.TcpClient]::new()
-                        $tcpClient.SendTimeout = $timeout
-                        $tcpClient.ReceiveTimeout = $timeout
-                        
-                        if ($proxy) {
-                            # Connect via proxy with HTTP CONNECT tunnel
-                            $tcpClient.Connect($proxy.Host, $proxy.Port)
-                            $networkStream = $tcpClient.GetStream()
-                            
-                            $writer = [System.IO.StreamWriter]::new($networkStream, [System.Text.Encoding]::ASCII)
-                            $writer.AutoFlush = $true
-                            $reader = [System.IO.StreamReader]::new($networkStream, [System.Text.Encoding]::ASCII)
-                            
-                            $writer.WriteLine("CONNECT $($ep.HostName):443 HTTP/1.1")
-                            $writer.WriteLine("Host: $($ep.HostName):443")
-                            $writer.WriteLine("")
-                            
-                            $response = $reader.ReadLine()
-                            if ($response -notmatch "^HTTP/\d\.\d 200") {
-                                throw "Proxy CONNECT failed: $response"
+                        $probeResult = Invoke-WithRetryLocal -Action {
+                            $attemptTcpClient = $null
+                            $attemptSslStream = $null
+                            $attemptNetworkStream = $null
+                            $attemptReader = $null
+                            $attemptWriter = $null
+
+                            try {
+                                $attemptTcpClient = [System.Net.Sockets.TcpClient]::new()
+                                $attemptTcpClient.SendTimeout = $timeout
+                                $attemptTcpClient.ReceiveTimeout = $timeout
+
+                                if ($proxy) {
+                                    $attemptTcpClient.Connect($proxy.Host, $proxy.Port)
+                                    $attemptNetworkStream = $attemptTcpClient.GetStream()
+
+                                    $attemptWriter = [System.IO.StreamWriter]::new($attemptNetworkStream, [System.Text.Encoding]::ASCII)
+                                    $attemptWriter.AutoFlush = $true
+                                    $attemptReader = [System.IO.StreamReader]::new($attemptNetworkStream, [System.Text.Encoding]::ASCII)
+
+                                    $attemptWriter.WriteLine("CONNECT $($ep.HostName):443 HTTP/1.1")
+                                    $attemptWriter.WriteLine("Host: $($ep.HostName):443")
+                                    $attemptWriter.WriteLine("")
+
+                                    $response = $attemptReader.ReadLine()
+                                    if ($response -notmatch "^HTTP/\d\.\d 200") {
+                                        throw "Proxy CONNECT failed: $response"
+                                    }
+                                    while ($true) {
+                                        $line = $attemptReader.ReadLine()
+                                        if ([string]::IsNullOrEmpty($line)) { break }
+                                    }
+
+                                    $attemptSslStream = [System.Net.Security.SslStream]::new(
+                                        $attemptNetworkStream, $false,
+                                        { param($s, $certificate, $chain, $sslPolicyErrors) return $true }
+                                    )
+                                }
+                                else {
+                                    $attemptTcpClient.Connect($ep.HostName, 443)
+                                    $attemptSslStream = [System.Net.Security.SslStream]::new(
+                                        $attemptTcpClient.GetStream(), $false,
+                                        { param($s, $certificate, $chain, $sslPolicyErrors) return $true }
+                                    )
+                                }
+
+                                $attemptSslStream.AuthenticateAsClient($ep.HostName)
+                                $cert = $attemptSslStream.RemoteCertificate
+
+                                if ($cert) {
+                                    $x509 = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($cert)
+                                    $certDetails = Get-CertificateChainDetailsLocal -Certificate $x509
+                                    return [PSCustomObject]@{
+                                        ExpirationDate         = $x509.NotAfter
+                                        Subject                = $certDetails.Subject
+                                        Issuer                 = $certDetails.Issuer
+                                        IssuingCA              = $certDetails.IssuingCA
+                                        ServerCertificateCount = $certDetails.ServerCertificateCount
+                                        IntermediateCA         = $certDetails.IntermediateCA
+                                        RootCA                 = $certDetails.RootCA
+                                        ChainStatus            = $certDetails.ChainStatus
+                                        DigiCertIssued         = $certDetails.DigiCertIssued
+                                    }
+                                }
+
+                                return $null
                             }
-                            while ($true) {
-                                $line = $reader.ReadLine()
-                                if ([string]::IsNullOrEmpty($line)) { break }
+                            finally {
+                                if ($attemptWriter) { $attemptWriter.Dispose() }
+                                if ($attemptReader) { $attemptReader.Dispose() }
+                                if ($attemptSslStream) { $attemptSslStream.Dispose() }
+                                if ($attemptTcpClient) { $attemptTcpClient.Dispose() }
                             }
-                            
-                            $sslStream = [System.Net.Security.SslStream]::new(
-                                $networkStream, $false,
-                                { param($s, $certificate, $chain, $sslPolicyErrors) return $true }
-                            )
-                        } else {
-                            # Direct connection
-                            $tcpClient.Connect($ep.HostName, 443)
-                            $sslStream = [System.Net.Security.SslStream]::new(
-                                $tcpClient.GetStream(), $false,
-                                { param($s, $certificate, $chain, $sslPolicyErrors) return $true }
-                            )
+                        } -MaxAttempts $tlsRetryCount -BaseDelayMs $retryBaseDelayMs
+
+                        if ($probeResult) {
+                            $expiryDate = $probeResult.ExpirationDate
+                            $subject = $probeResult.Subject
+                            $issuer = $probeResult.Issuer
+                            $issuingCA = $probeResult.IssuingCA
+                            $serverCertificateCount = $probeResult.ServerCertificateCount
+                            $intermediateCA = $probeResult.IntermediateCA
+                            $rootCA = $probeResult.RootCA
+                            $chainStatus = $probeResult.ChainStatus
+                            $digiCertIssued = $probeResult.DigiCertIssued
                         }
-                        
-                        $sslStream.AuthenticateAsClient($ep.HostName)
-                        $cert = $sslStream.RemoteCertificate
-                        
-                        if ($cert) {
-                            $x509 = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($cert)
-                            $expiryDate = $x509.NotAfter
-                            $subject = $x509.Subject
-                        }
-                        
-                        $sslStream.Dispose()
-                        $tcpClient.Dispose()
                     } catch {
-                        $innerEx = $_.Exception.InnerException
-                        while ($innerEx -and $innerEx.InnerException) { $innerEx = $innerEx.InnerException }
-                        $errorMsg = if ($innerEx) { $innerEx.Message } else { $_.Exception.Message }
                     }
                     
                     # Calculate expiration status
@@ -1378,7 +2784,7 @@ elseif ($PSCmdlet.ParameterSetName -eq 'ScanTenant') {
                     $expiryStatus = 'OK'
                     if ($expiryDate) {
                         $expiryDisplay = $expiryDate.ToString()
-                        $daysUntilExpiry = ($expiryDate - (Get-Date)).Days
+                        $daysUntilExpiry = ($expiryDate - $scanAt).Days
                         $expiryStatus = if ($daysUntilExpiry -lt 0) { 'EXPIRED' } elseif ($daysUntilExpiry -le $warnDays) { 'WARNING' } else { 'OK' }
                     }
                     
@@ -1390,37 +2796,27 @@ elseif ($PSCmdlet.ParameterSetName -eq 'ScanTenant') {
                         Domain             = $ep.HostName
                         CertificateType    = $ep.CertificateSource
                         ProvisioningState  = $ep.ProvisioningState
+                        ValidationState    = $null
                         Subject            = $subject
+                        Issuer             = $issuer
+                        IssuingCA          = $issuingCA
+                        ServerCertificateCount = $serverCertificateCount
+                        IntermediateCA         = $intermediateCA
+                        RootCA                 = $rootCA
+                        ChainStatus            = $chainStatus
+                        DigiCertIssued         = $digiCertIssued
                         ExpirationDate     = $expiryDisplay
                         ExpirationStatus   = $expiryStatus
                         KeyVaultName       = $ep.KeyVaultName
                         KeyVaultSecretName = $ep.KeyVaultSecretName
-                        TlsError           = $errorMsg
-                        __Progress         = $true
                     }
                 } | ForEach-Object {
                     $tlsProcessedCount++
                     if (($tlsProcessedCount % $tlsProgressInterval -eq 0) -or ($tlsProcessedCount -eq $classicEndpoints.Count)) {
-                        $status = if ($_.TlsError) { "Error" } else { "OK" }
-                        Write-Host "    TLS probed $tlsProcessedCount/$($classicEndpoints.Count): $($_.Domain) -> $status" -ForegroundColor DarkGray
+                        Write-Host "    TLS probed $tlsProcessedCount/$($classicEndpoints.Count): $($_.Domain)" -ForegroundColor DarkGray
                     }
-                    
-                    # Remove internal properties and add to results
-                    $result = [PSCustomObject]@{
-                        SubscriptionId     = $_.SubscriptionId
-                        SubscriptionName   = $_.SubscriptionName
-                        FrontDoorName      = $_.FrontDoorName
-                        FrontDoorType      = $_.FrontDoorType
-                        Domain             = $_.Domain
-                        CertificateType    = $_.CertificateType
-                        ProvisioningState  = $_.ProvisioningState
-                        Subject            = $_.Subject
-                        ExpirationDate     = $_.ExpirationDate
-                        ExpirationStatus   = $_.ExpirationStatus
-                        KeyVaultName       = $_.KeyVaultName
-                        KeyVaultSecretName = $_.KeyVaultSecretName
-                    }
-                    $allResults.Add($result)
+
+                    $allResults.Add($_)
                 }
                 Write-Host "    Completed Classic TLS probing." -ForegroundColor Green
             }
@@ -1436,8 +2832,8 @@ if ($allResults.Count -eq 0) {
     Write-Host "`n=== Certificate Details ===" -ForegroundColor Green
     Write-Host ""
     
-    # Check if any result has ValidationState (Standard/Premium) or not (Classic)
-    $hasValidationState = $allResults[0].PSObject.Properties.Name -contains 'ValidationState'
+    # Show ValidationState only when Standard/Premium rows are present; Classic rows keep it blank.
+    $hasValidationState = @($allResults | Where-Object { $_.FrontDoorType -eq 'Standard/Premium' }).Count -gt 0
     
     # Get dynamic column widths based on console size
     $colWidths = Get-DynamicColumnWidths -hasValidationState $hasValidationState
@@ -1450,17 +2846,18 @@ if ($allResults.Count -eq 0) {
     $colProvState = $colWidths['ProvState']
     $colValState = if ($hasValidationState) { $colWidths['ValState'] } else { 0 }
     $colSubject = $colWidths['Subject']
+    $colIssuingCA = $colWidths['IssuingCA']
     $colExpiry = $colWidths['ExpirationDate']
     $colKVName = $colWidths['KVName']
     $colKVSecret = $colWidths['KVSecret']
     
     # Display header
     if ($hasValidationState) {
-        Write-Host ("{0,-$colSub} {1,-$colFD} {2,-$colFDType} {3,-$colDomain} {4,-$colCertType} {5,-$colProvState} {6,-$colValState} {7,-$colSubject} {8,-$colExpiry} {9,-$colKVName} {10}" -f "Subscription", "FrontDoor", "FDType", "Domain", "CertType", "ProvState", "ValState", "Subject", "ExpirationDate", "KVName", "KVSecret") -ForegroundColor Cyan
-        Write-Host ("{0,-$colSub} {1,-$colFD} {2,-$colFDType} {3,-$colDomain} {4,-$colCertType} {5,-$colProvState} {6,-$colValState} {7,-$colSubject} {8,-$colExpiry} {9,-$colKVName} {10}" -f ("-" * $colSub), ("-" * $colFD), ("-" * $colFDType), ("-" * $colDomain), ("-" * $colCertType), ("-" * $colProvState), ("-" * $colValState), ("-" * $colSubject), ("-" * $colExpiry), ("-" * $colKVName), ("-" * $colKVSecret)) -ForegroundColor Cyan
+        Write-Host ("{0,-$colSub} {1,-$colFD} {2,-$colFDType} {3,-$colDomain} {4,-$colCertType} {5,-$colProvState} {6,-$colValState} {7,-$colSubject} {8,-$colIssuingCA} {9,-$colExpiry} {10,-$colKVName} {11}" -f "Subscription", "FrontDoor", "FDType", "Domain", "CertType", "ProvState", "ValState", "Subject", "IssuingCA", "ExpirationDate", "KVName", "KVSecret") -ForegroundColor Cyan
+        Write-Host ("{0,-$colSub} {1,-$colFD} {2,-$colFDType} {3,-$colDomain} {4,-$colCertType} {5,-$colProvState} {6,-$colValState} {7,-$colSubject} {8,-$colIssuingCA} {9,-$colExpiry} {10,-$colKVName} {11}" -f ("-" * $colSub), ("-" * $colFD), ("-" * $colFDType), ("-" * $colDomain), ("-" * $colCertType), ("-" * $colProvState), ("-" * $colValState), ("-" * $colSubject), ("-" * $colIssuingCA), ("-" * $colExpiry), ("-" * $colKVName), ("-" * $colKVSecret)) -ForegroundColor Cyan
     } else {
-        Write-Host ("{0,-$colSub} {1,-$colFD} {2,-$colFDType} {3,-$colDomain} {4,-$colCertType} {5,-$colProvState} {6,-$colSubject} {7,-$colExpiry} {8,-$colKVName} {9}" -f "Subscription", "FrontDoor", "FDType", "Domain", "CertType", "ProvState", "Subject", "ExpirationDate", "KVName", "KVSecret") -ForegroundColor Cyan
-        Write-Host ("{0,-$colSub} {1,-$colFD} {2,-$colFDType} {3,-$colDomain} {4,-$colCertType} {5,-$colProvState} {6,-$colSubject} {7,-$colExpiry} {8,-$colKVName} {9}" -f ("-" * $colSub), ("-" * $colFD), ("-" * $colFDType), ("-" * $colDomain), ("-" * $colCertType), ("-" * $colProvState), ("-" * $colSubject), ("-" * $colExpiry), ("-" * $colKVName), ("-" * $colKVSecret)) -ForegroundColor Cyan
+        Write-Host ("{0,-$colSub} {1,-$colFD} {2,-$colFDType} {3,-$colDomain} {4,-$colCertType} {5,-$colProvState} {6,-$colSubject} {7,-$colIssuingCA} {8,-$colExpiry} {9,-$colKVName} {10}" -f "Subscription", "FrontDoor", "FDType", "Domain", "CertType", "ProvState", "Subject", "IssuingCA", "ExpirationDate", "KVName", "KVSecret") -ForegroundColor Cyan
+        Write-Host ("{0,-$colSub} {1,-$colFD} {2,-$colFDType} {3,-$colDomain} {4,-$colCertType} {5,-$colProvState} {6,-$colSubject} {7,-$colIssuingCA} {8,-$colExpiry} {9,-$colKVName} {10}" -f ("-" * $colSub), ("-" * $colFD), ("-" * $colFDType), ("-" * $colDomain), ("-" * $colCertType), ("-" * $colProvState), ("-" * $colSubject), ("-" * $colIssuingCA), ("-" * $colExpiry), ("-" * $colKVName), ("-" * $colKVSecret)) -ForegroundColor Cyan
     }
     
     # Display results with color coding and truncation
@@ -1484,6 +2881,7 @@ if ($allResults.Count -eq 0) {
         $dispCertType = Get-TruncatedString $certTypeDisplay ($colCertType - 1)
         
         $dispSubject = Get-TruncatedString $result.Subject ($colSubject - 1)
+        $dispIssuingCA = Get-TruncatedString $result.IssuingCA ($colIssuingCA - 1)
         $dispKVName = Get-TruncatedString $result.KeyVaultName ($colKVName - 1)
         $dispKVSecret = Get-TruncatedString $result.KeyVaultSecretName ($colKVSecret - 1)
         
@@ -1527,6 +2925,7 @@ if ($allResults.Count -eq 0) {
         
         # Subject
         Write-Host (" {0,-$colSubject}" -f $dispSubject) -NoNewline
+        Write-Host (" {0,-$colIssuingCA}" -f $dispIssuingCA) -NoNewline
         
         # Expiration Date with color
         if ($result.ExpirationStatus -eq 'EXPIRED') {
@@ -1563,15 +2962,16 @@ if ($allResults.Count -eq 0) {
     
     # Export to CSV if requested
     if ($ExportCsvPath) {
-        $allResults | Export-Csv -Path $ExportCsvPath -NoTypeInformation -Force
-        Write-Host "`nResults exported to: $ExportCsvPath" -ForegroundColor Green
+        $resolvedExportCsvPath = Ensure-ParentDirectoryExists -FilePath $ExportCsvPath
+        $exportColumns = Get-ResultExportColumns
+        $allResults | Select-Object $exportColumns | Export-Csv -Path $resolvedExportCsvPath -NoTypeInformation -Force
+        Write-Host "`nResults exported to: $resolvedExportCsvPath" -ForegroundColor Green
     }
     
     # Display in GridView if requested
     if ($GridView) {
         Write-Host "`nOpening GridView..." -ForegroundColor Cyan
-        $allResults | Select-Object SubscriptionName, FrontDoorName, FrontDoorType, Domain, CertificateType, `
-            ProvisioningState, ValidationState, Subject, ExpirationDate, ExpirationStatus, `
-            KeyVaultName, KeyVaultSecretName | Out-GridView -Title "Azure Front Door Certificates"
+        $gridViewColumns = Get-ResultExportColumns
+        $allResults | Select-Object $gridViewColumns | Out-GridView -Title "Azure Front Door Certificates"
     }
 }
