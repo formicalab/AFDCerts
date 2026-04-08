@@ -54,6 +54,20 @@
     Number of days before certificate expiration to show warning indicators. Default is 30 days.
     Certificates expiring within this period will be highlighted with warning symbols.
 
+.PARAMETER ThrottleLimit
+    Parallelism for ARM API calls when scanning Front Doors. Default is auto-calculated based on
+    CPU count (ProcessorCount * 4, capped between 8-32). Higher values increase speed but may
+    hit Azure API throttling limits.
+
+.PARAMETER TlsThrottleLimit
+    Parallelism for TLS certificate checks on Classic Front Door endpoints. Default is auto-calculated
+    (ProcessorCount * 8, capped between 16-64). Can be set higher than ThrottleLimit since TLS
+    operations are network-bound rather than CPU-bound.
+
+.PARAMETER TlsTimeoutMs
+    Timeout in milliseconds for TLS certificate fetch operations. Default is 5000ms (5 seconds).
+    Increase if operating through slow proxies or high-latency networks.
+
 .INPUTS
     None. This script does not accept pipeline input.
 
@@ -97,6 +111,18 @@
     Retrieves certificate information with a custom warning period of 60 days instead of
     the default 30 days.
 
+.EXAMPLE
+    .\get-frontdoor-certs.ps1 -ScanTenant -ThrottleLimit 16 -TlsThrottleLimit 64
+    
+    Scans all Front Door profiles across the tenant with custom parallelism settings.
+    Useful for tuning performance based on your environment.
+
+.EXAMPLE
+    .\get-frontdoor-certs.ps1 -ScanTenant -FrontDoorType Classic -TlsTimeoutMs 10000
+    
+    Scans only Classic Front Door profiles with an extended TLS timeout of 10 seconds.
+    Useful when operating through slow proxies.
+
 .NOTES   
     Network Considerations:
     - For Classic Front Door, the script uses TcpClient + SslStream to fetch certificates
@@ -112,7 +138,13 @@
     
     Module Requirements:
     - Az.Accounts module is required for all modes
-    - Az.ResourceGraph module is required for -ScanTenant mode (Install-Module Az.ResourceGraph)
+    - Az.FrontDoor module is required for Classic Front Door enumeration in subscription mode
+    
+    Performance:
+    - Tenant mode uses parallel processing for faster scanning
+    - ThrottleLimit controls parallelism for ARM API calls (Standard/Premium FDs)
+    - TlsThrottleLimit controls parallelism for TLS certificate probing (Classic FDs)
+    - Progress updates are batched to reduce console I/O overhead
 
 .LINK
     https://github.com/formicalab/AFDCerts
@@ -154,7 +186,19 @@ param(
     [switch]$GridView,
 
     [Parameter(Mandatory = $false, HelpMessage = 'Number of days before expiration to show warning (default: 30)')]
-    [int]$WarningDays = 30
+    [int]$WarningDays = 30,
+
+    [Parameter(Mandatory = $false, HelpMessage = 'Parallelism for ARM API calls (default: auto-calculated based on CPU)')]
+    [ValidateRange(1, 64)]
+    [int]$ThrottleLimit = [Math]::Min([Math]::Max([System.Environment]::ProcessorCount * 4, 8), 32),
+
+    [Parameter(Mandatory = $false, HelpMessage = 'Parallelism for TLS certificate checks (default: auto-calculated, higher for network-bound operations)')]
+    [ValidateRange(1, 256)]
+    [int]$TlsThrottleLimit = [Math]::Min([Math]::Max([System.Environment]::ProcessorCount * 8, 16), 64),
+
+    [Parameter(Mandatory = $false, HelpMessage = 'Timeout in milliseconds for TLS certificate checks (default: 5000)')]
+    [ValidateRange(1000, 30000)]
+    [int]$TlsTimeoutMs = 5000
 )
 
 Set-StrictMode -Version 1
@@ -175,6 +219,198 @@ if ($detectedProxy -and $detectedProxy.Host -ne $proxyTestUri.Host) {
 } else {
     Write-Host "No proxy detected - using direct connections" -ForegroundColor Gray
 }
+
+#region Bearer Token and Authentication Helpers
+
+# Converts access token values that Az.Accounts can surface either as strings or SecureStrings.
+function ConvertTo-PlainText {
+    param(
+        [Parameter(Mandatory)]
+        [AllowNull()]
+        [object]$Value
+    )
+
+    if ($Value -is [string]) {
+        return $Value
+    }
+
+    if ($Value -is [securestring]) {
+        $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($Value)
+        try {
+            return [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
+        }
+        finally {
+            if ($bstr -ne [IntPtr]::Zero) {
+                [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+            }
+        }
+    }
+
+    throw "ConvertTo-PlainText: unexpected type [$($Value.GetType().FullName)]."
+}
+
+# Decodes the payload section of a JWT so the script can extract the actual token tenant.
+function Get-JwtPayload {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Token
+    )
+
+    $parts = $Token -split '\.'
+    if ($parts.Count -lt 2 -or [string]::IsNullOrWhiteSpace($parts[1])) {
+        return $null
+    }
+
+    $payloadSegment = $parts[1]
+    switch ($payloadSegment.Length % 4) {
+        2 { $payloadSegment += '==' }
+        3 { $payloadSegment += '=' }
+        0 { }
+        default { return $null }
+    }
+
+    try {
+        $json = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($payloadSegment.Replace('-', '+').Replace('_', '/')))
+        return $json | ConvertFrom-Json -ErrorAction Stop
+    }
+    catch {
+        return $null
+    }
+}
+
+# Acquires one Azure management-plane token and returns resolved user and tenant metadata.
+function Get-ArmBearerToken {
+    $context = Get-AzContext -ErrorAction SilentlyContinue
+    if (-not $context -or -not $context.Account) {
+        throw "No Azure PowerShell context found. Run Connect-AzAccount first."
+    }
+
+    $tokenResponse = Get-AzAccessToken -ResourceUrl 'https://management.azure.com' -ErrorAction Stop
+    $rawToken = if ($tokenResponse.PSObject.Properties['Token']) {
+        $tokenResponse.Token
+    }
+    elseif ($tokenResponse.PSObject.Properties['AccessToken']) {
+        $tokenResponse.AccessToken
+    }
+    else {
+        $null
+    }
+
+    $token = ConvertTo-PlainText -Value $rawToken
+    if ([string]::IsNullOrWhiteSpace($token)) {
+        throw 'Failed to acquire an Azure access token from Az.Accounts.'
+    }
+
+    $tokenPayload = Get-JwtPayload -Token $token
+    $tenantId = if ($tokenPayload -and $tokenPayload.PSObject.Properties['tid']) {
+        [string]$tokenPayload.tid
+    }
+    elseif ($tokenResponse.PSObject.Properties['TenantId'] -and $tokenResponse.TenantId) {
+        [string]$tokenResponse.TenantId
+    }
+    elseif ($context.Tenant -and $context.Tenant.Id) {
+        [string]$context.Tenant.Id
+    }
+    else {
+        $null
+    }
+
+    $userId = if ($tokenPayload -and $tokenPayload.PSObject.Properties['upn'] -and $tokenPayload.upn) {
+        [string]$tokenPayload.upn
+    }
+    elseif ($tokenPayload -and $tokenPayload.PSObject.Properties['unique_name'] -and $tokenPayload.unique_name) {
+        [string]$tokenPayload.unique_name
+    }
+    elseif ($tokenResponse.PSObject.Properties['UserId'] -and $tokenResponse.UserId) {
+        [string]$tokenResponse.UserId
+    }
+    elseif ($context.Account -and $context.Account.Id) {
+        [string]$context.Account.Id
+    }
+    else {
+        $null
+    }
+
+    return [pscustomobject]@{
+        Token    = $token
+        TenantId = $tenantId
+        UserId   = $userId
+    }
+}
+
+# Returns every enabled Azure subscription the current identity can enumerate.
+function Get-EnabledSubscriptions {
+    $subscriptions = @(Get-AzSubscription -WarningAction SilentlyContinue | Where-Object { $_.State -eq 'Enabled' })
+    if (-not $subscriptions) {
+        throw 'No enabled Azure subscriptions are accessible for the current identity.'
+    }
+
+    return @($subscriptions | Sort-Object Name, Id)
+}
+
+# Executes a Resource Graph query via REST API across all target subscriptions with pagination.
+function Invoke-ResourceGraphQueryAllPages {
+    param(
+        [Parameter(Mandatory)]
+        [hashtable]$Headers,
+
+        [Parameter(Mandatory)]
+        [string[]]$SubscriptionIds,
+
+        [Parameter(Mandatory)]
+        [string]$Query
+    )
+
+    $results = [System.Collections.Generic.List[object]]::new()
+    $skipToken = $null
+    $graphUri = 'https://management.azure.com/providers/Microsoft.ResourceGraph/resources?api-version=2022-10-01'
+
+    do {
+        $options = @{ resultFormat = 'objectArray'; '$top' = 1000 }
+        if ($skipToken) {
+            $options['$skipToken'] = $skipToken
+        }
+
+        $body = @{
+            subscriptions = $SubscriptionIds
+            query         = $Query
+            options       = $options
+        } | ConvertTo-Json -Depth 8
+
+        $response = Invoke-RestMethod -Method Post -Uri $graphUri -Headers $Headers -Body $body -ErrorAction Stop
+        foreach ($row in @($response.data)) {
+            $results.Add($row)
+        }
+
+        $skipToken = $null
+        foreach ($propertyName in '$skipToken', 'skipToken') {
+            $property = $response.PSObject.Properties[$propertyName]
+            if ($property -and $property.Value) {
+                $skipToken = [string]$property.Value
+                break
+            }
+        }
+    }
+    while ($skipToken)
+
+    return @($results)
+}
+
+# Limits progress chatter by emitting at most about twenty updates for large loops.
+function Get-ProgressInterval {
+    param(
+        [Parameter(Mandatory)]
+        [int]$TotalCount
+    )
+
+    if ($TotalCount -le 0) {
+        return 1
+    }
+
+    return [Math]::Max([int][Math]::Ceiling($TotalCount / 20.0), 1)
+}
+
+#endregion
 
 # Verify Azure login
 $context = Get-AzContext
@@ -458,11 +694,18 @@ function Get-AllFrontDoorsInSubscription {
 
 #endregion
 
-#region Get All Front Doors in Tenant (Resource Graph)
+#region Get All Front Doors in Tenant (Resource Graph via REST API)
 
-# Function to get all Front Door profiles across all subscriptions using Azure Resource Graph
+# Function to get all Front Door profiles across all subscriptions using Azure Resource Graph REST API
+# This approach avoids the null tenant issue with Search-AzGraph cmdlet and supports proper pagination
 function Get-AllFrontDoorsInTenant {
     param(
+        [Parameter(Mandatory)]
+        [hashtable]$Headers,
+
+        [Parameter(Mandatory)]
+        [string[]]$SubscriptionIds,
+
         [Parameter(Mandatory = $false)]
         [ValidateSet('All', 'StandardPremium', 'Classic')]
         [string]$TypeFilter = 'All'
@@ -473,18 +716,29 @@ function Get-AllFrontDoorsInTenant {
         Write-Host "  Filtering by type: $TypeFilter" -ForegroundColor Cyan
     }
     
-    $frontDoors = @()
+    $frontDoors = [System.Collections.Generic.List[PSCustomObject]]::new()
     
-    # Query for Standard/Premium Front Doors (Microsoft.Cdn/profiles with AzureFrontDoor SKU)
+    # Combined query for all Front Door types
+    $queryAll = @"
+resources
+| where type in~ ('microsoft.cdn/profiles', 'microsoft.network/frontdoors')
+| extend skuName = tostring(sku.name)
+| extend deploymentModel = case(type =~ 'microsoft.network/frontdoors', 'Classic', 'Standard/Premium')
+| where type =~ 'microsoft.network/frontdoors' or skuName in~ ('Standard_AzureFrontDoor', 'Premium_AzureFrontDoor')
+| project name, resourceGroup, subscriptionId, type, deploymentModel
+| order by subscriptionId, name
+"@
+
+    # Query for Standard/Premium only
     $queryStdPremium = @"
 resources
 | where type == 'microsoft.cdn/profiles'
 | where sku.name in ('Standard_AzureFrontDoor', 'Premium_AzureFrontDoor')
-| project name, resourceGroup, subscriptionId, type, sku
+| project name, resourceGroup, subscriptionId, type
 | order by subscriptionId, name
 "@
 
-    # Query for Classic Front Doors (Microsoft.Network/frontDoors)
+    # Query for Classic only
     $queryClassic = @"
 resources
 | where type == 'microsoft.network/frontdoors'
@@ -492,52 +746,48 @@ resources
 | order by subscriptionId, name
 "@
 
-    # Execute Standard/Premium query
-    if ($TypeFilter -eq 'All' -or $TypeFilter -eq 'StandardPremium') {
-        try {
-            Write-Host "  Querying Standard/Premium Front Doors..." -ForegroundColor Cyan
-            $stdPremiumResults = Search-AzGraph -Query $queryStdPremium -First 1000 -ErrorAction Stop
+    # Select query based on filter
+    $query = switch ($TypeFilter) {
+        'StandardPremium' { $queryStdPremium }
+        'Classic' { $queryClassic }
+        default { $queryAll }
+    }
+
+    try {
+        Write-Host "  Executing Resource Graph query via REST API..." -ForegroundColor Cyan
+        $results = Invoke-ResourceGraphQueryAllPages -Headers $Headers -SubscriptionIds $SubscriptionIds -Query $query
+        
+        foreach ($result in $results) {
+            $fdType = if ($result.type -eq 'microsoft.network/frontdoors') { 'Classic' } 
+                      elseif ($result.deploymentModel) { $result.deploymentModel }
+                      else { 'Standard/Premium' }
             
-            foreach ($result in $stdPremiumResults) {
-                $frontDoors += [PSCustomObject]@{
-                    Name              = $result.name
-                    ResourceGroupName = $result.resourceGroup
-                    SubscriptionId    = $result.subscriptionId
-                    Type              = 'Standard/Premium'
-                }
-            }
-            Write-Host "    Found $($stdPremiumResults.Count) Standard/Premium Front Door(s)" -ForegroundColor Green
+            $frontDoors.Add([PSCustomObject]@{
+                Name              = $result.name
+                ResourceGroupName = $result.resourceGroup
+                SubscriptionId    = $result.subscriptionId
+                Type              = $fdType
+            })
         }
-        catch {
-            Write-Host "    Failed to query Standard/Premium Front Doors via Resource Graph: $($_.Exception.Message)" -ForegroundColor Yellow
-            Write-Host "    Make sure you have the Az.ResourceGraph module installed (Install-Module Az.ResourceGraph)" -ForegroundColor Yellow
+        
+        # Show breakdown by type
+        $stdPremCount = ($frontDoors | Where-Object { $_.Type -eq 'Standard/Premium' }).Count
+        $classicCount = ($frontDoors | Where-Object { $_.Type -eq 'Classic' }).Count
+        if ($TypeFilter -eq 'All' -or $TypeFilter -eq 'StandardPremium') {
+            Write-Host "    Found $stdPremCount Standard/Premium Front Door(s)" -ForegroundColor Green
+        }
+        if ($TypeFilter -eq 'All' -or $TypeFilter -eq 'Classic') {
+            Write-Host "    Found $classicCount Classic Front Door(s)" -ForegroundColor Green
         }
     }
-    
-    # Execute Classic query
-    if ($TypeFilter -eq 'All' -or $TypeFilter -eq 'Classic') {
-        try {
-            Write-Host "  Querying Classic Front Doors..." -ForegroundColor Cyan
-            $classicResults = Search-AzGraph -Query $queryClassic -First 1000 -ErrorAction Stop
-            
-            foreach ($result in $classicResults) {
-                $frontDoors += [PSCustomObject]@{
-                    Name              = $result.name
-                    ResourceGroupName = $result.resourceGroup
-                    SubscriptionId    = $result.subscriptionId
-                    Type              = 'Classic'
-                }
-            }
-            Write-Host "    Found $($classicResults.Count) Classic Front Door(s)" -ForegroundColor Green
-        }
-        catch {
-            Write-Host "    Failed to query Classic Front Doors via Resource Graph: $($_.Exception.Message)" -ForegroundColor Yellow
-        }
+    catch {
+        Write-Host "    Failed to query Front Doors via Resource Graph REST API: $($_.Exception.Message)" -ForegroundColor Yellow
+        throw
     }
     
     Write-Host "  Total: $($frontDoors.Count) Front Door profile(s) found across tenant`n" -ForegroundColor Cyan
     
-    return $frontDoors
+    return @($frontDoors)
 }
 
 #endregion
@@ -845,49 +1095,323 @@ elseif ($PSCmdlet.ParameterSetName -eq 'ScanSubscription') {
     }
 }
 elseif ($PSCmdlet.ParameterSetName -eq 'ScanTenant') {
-    # Tenant-wide scanning mode using Azure Resource Graph
+    # Tenant-wide scanning mode using Azure Resource Graph REST API with parallel processing
     Write-Host "Scanning all Front Door profiles across tenant using Resource Graph..." -ForegroundColor Cyan
+    Write-Host "  Parallelism: ThrottleLimit=$ThrottleLimit, TlsThrottleLimit=$TlsThrottleLimit" -ForegroundColor Gray
     
-    # Get all Front Doors across tenant using Resource Graph
-    $allFrontDoors = Get-AllFrontDoorsInTenant -TypeFilter $FrontDoorType
+    # Step 1: Acquire bearer token (avoids null tenant issue with Search-AzGraph)
+    Write-Host "`n[1/4] Acquiring Azure bearer token..." -ForegroundColor Cyan
+    $tokenInfo = Get-ArmBearerToken
+    $script:Headers = @{ Authorization = "Bearer $($tokenInfo.Token)"; 'Content-Type' = 'application/json' }
+    
+    $tokenLabelParts = [System.Collections.Generic.List[string]]::new()
+    if ($tokenInfo.UserId) { $tokenLabelParts.Add($tokenInfo.UserId) }
+    if ($tokenInfo.TenantId) { $tokenLabelParts.Add("tenant $($tokenInfo.TenantId)") }
+    if ($tokenLabelParts.Count -gt 0) {
+        Write-Host "  Token acquired for: $($tokenLabelParts -join ' | ')" -ForegroundColor Green
+    } else {
+        Write-Host "  Token acquired successfully." -ForegroundColor Green
+    }
+    
+    # Step 2: Get enabled subscriptions
+    Write-Host "`n[2/4] Resolving enabled subscriptions..." -ForegroundColor Cyan
+    $subscriptions = Get-EnabledSubscriptions
+    $subscriptionIds = @($subscriptions | Select-Object -ExpandProperty Id)
+    $subscriptionLookup = @{}
+    foreach ($sub in $subscriptions) {
+        $subscriptionLookup[$sub.Id] = $sub.Name
+    }
+    Write-Host "  $($subscriptions.Count) enabled subscription(s) accessible." -ForegroundColor Green
+    
+    # Step 3: Query Front Doors via Resource Graph REST API
+    Write-Host "`n[3/4] Discovering Front Door profiles via Resource Graph..." -ForegroundColor Cyan
+    $allFrontDoors = Get-AllFrontDoorsInTenant -Headers $script:Headers -SubscriptionIds $subscriptionIds -TypeFilter $FrontDoorType
     
     if ($allFrontDoors.Count -eq 0) {
         Write-Host "No Front Door profiles found in the tenant." -ForegroundColor Yellow
     } else {
-        # Group by subscription to minimize context switches
-        $groupedBySubscription = $allFrontDoors | Group-Object SubscriptionId | Sort-Object Name
+        # Step 4: Process Front Doors in parallel grouped by type
+        Write-Host "[4/4] Processing certificates (parallel=$ThrottleLimit)..." -ForegroundColor Cyan
         
-        Write-Host "Found Front Door profiles in $($groupedBySubscription.Count) subscription(s)" -ForegroundColor Cyan
-        Write-Host "Processing sorted by subscription to minimize context switches...`n" -ForegroundColor Cyan
+        $standardPremiumFDs = @($allFrontDoors | Where-Object { $_.Type -eq 'Standard/Premium' })
+        $classicFDs = @($allFrontDoors | Where-Object { $_.Type -eq 'Classic' })
         
-        $subscriptionCount = 0
-        foreach ($subGroup in $groupedBySubscription) {
-            $subscriptionCount++
-            $subscriptionId = $subGroup.Name
-            $frontDoorsInSub = $subGroup.Group
+        # Process Standard/Premium Front Doors in parallel (ARM REST API calls)
+        if ($standardPremiumFDs.Count -gt 0) {
+            Write-Host "  Processing $($standardPremiumFDs.Count) Standard/Premium Front Door(s) in parallel..." -ForegroundColor Cyan
+            $progressInterval = Get-ProgressInterval -TotalCount $standardPremiumFDs.Count
+            $processedCount = 0
             
-            # Switch to the subscription
-            try {
-                $context = Set-AzContext -Subscription $subscriptionId -ErrorAction Stop
-                Write-Host "[$subscriptionCount/$($groupedBySubscription.Count)] Processing $($frontDoorsInSub.Count) Front Door(s) in subscription: $($context.Subscription.Name)" -ForegroundColor Yellow
-                Write-Host ("=" * 80) -ForegroundColor Yellow
-            }
-            catch {
-                Write-Host "[$subscriptionCount/$($groupedBySubscription.Count)] Failed to switch to subscription '$subscriptionId': $($_.Exception.Message)" -ForegroundColor Red
-                Write-Host "  Skipping $($frontDoorsInSub.Count) Front Door(s) in this subscription`n" -ForegroundColor Yellow
-                continue
-            }
-            
-            # Process each Front Door in this subscription
-            foreach ($fd in $frontDoorsInSub) {
-                $fdResults = Get-FrontDoorCertificates `
-                    -FrontDoorName $fd.Name `
-                    -ResourceGroupName $fd.ResourceGroupName `
-                    -WarningDays $WarningDays
+            $standardPremiumFDs | ForEach-Object -ThrottleLimit $ThrottleLimit -Parallel {
+                $fd = $_
+                $hdrs = $using:Headers
+                $apiVer = $using:ApiVersion
+                $subLookup = $using:subscriptionLookup
+                $warnDays = $using:WarningDays
                 
-                $fdResults | ForEach-Object { $allResults.Add($_) }
+                # Build ARM REST URI for this Front Door's custom domains
+                $baseUri = "https://management.azure.com/subscriptions/$($fd.SubscriptionId)/resourceGroups/$($fd.ResourceGroupName)/providers/Microsoft.Cdn/profiles/$($fd.Name)"
+                
+                try {
+                    # Get custom domains
+                    $domainsUri = "$baseUri/customDomains?api-version=$apiVer"
+                    $domainsResp = Invoke-RestMethod -Method Get -Uri $domainsUri -Headers $hdrs -ErrorAction Stop
+                    $domains = @($domainsResp.value)
+                    
+                    foreach ($d in $domains) {
+                        $domainName = $d.properties.hostName ?? $d.name
+                        $certSource = $null
+                        $provisioningState = $d.properties.provisioningState
+                        $validationState = $d.properties.domainValidationState
+                        $expiryDate = $null
+                        $subject = $null
+                        $keyVaultName = $null
+                        $keyVaultSecretName = $null
+                        
+                        # Get TLS settings
+                        if ($d.properties.tlsSettings) {
+                            $tls = $d.properties.tlsSettings
+                            $certSource = switch ($tls.certificateType) {
+                                'ManagedCertificate' { 'Managed' }
+                                'CustomerCertificate' { 'KeyVault' }
+                                default { $tls.certificateType }
+                            }
+                            
+                            # Fetch certificate details from secret
+                            if ($tls.secret -and $tls.secret.id) {
+                                $secretUri = "https://management.azure.com$($tls.secret.id)?api-version=$apiVer"
+                                try {
+                                    $secret = Invoke-RestMethod -Method Get -Uri $secretUri -Headers $hdrs -ErrorAction Stop
+                                    if ($secret.properties -and $secret.properties.parameters) {
+                                        $params = $secret.properties.parameters
+                                        if ($params.expirationDate) { $expiryDate = $params.expirationDate }
+                                        if ($params.subject) { $subject = $params.subject }
+                                        
+                                        if ($params.type -eq 'CustomerCertificate' -and $params.secretSource -and $params.secretSource.id) {
+                                            $kvSecretId = $params.secretSource.id
+                                            if ($kvSecretId -match '/vaults/([^/]+)/') { $keyVaultName = $Matches[1] }
+                                            if ($kvSecretId -match '/secrets/([^/]+)') { $keyVaultSecretName = $Matches[1] }
+                                        }
+                                    }
+                                } catch { }
+                            }
+                        }
+                        
+                        # Calculate expiration status
+                        $expiryDisplay = $null
+                        $expiryStatus = 'OK'
+                        if ($expiryDate) {
+                            try {
+                                $expiryDateTime = if ($expiryDate -is [DateTime]) { $expiryDate } else { [DateTime]::Parse($expiryDate) }
+                                $expiryDisplay = $expiryDateTime.ToString()
+                                $daysUntilExpiry = ($expiryDateTime - (Get-Date)).Days
+                                $expiryStatus = if ($daysUntilExpiry -lt 0) { 'EXPIRED' } elseif ($daysUntilExpiry -le $warnDays) { 'WARNING' } else { 'OK' }
+                            } catch { $expiryDisplay = $expiryDate }
+                        }
+                        
+                        [PSCustomObject]@{
+                            SubscriptionId     = $fd.SubscriptionId
+                            SubscriptionName   = $subLookup[$fd.SubscriptionId] ?? $fd.SubscriptionId
+                            FrontDoorName      = $fd.Name
+                            FrontDoorType      = 'Standard/Premium'
+                            Domain             = $domainName
+                            CertificateType    = $certSource
+                            ProvisioningState  = $provisioningState
+                            ValidationState    = $validationState
+                            Subject            = $subject
+                            ExpirationDate     = $expiryDisplay
+                            ExpirationStatus   = $expiryStatus
+                            KeyVaultName       = $keyVaultName
+                            KeyVaultSecretName = $keyVaultSecretName
+                        }
+                    }
+                    
+                    # Progress marker
+                    [PSCustomObject]@{ __Progress = $true; FrontDoorName = $fd.Name; DomainCount = $domains.Count }
+                } catch {
+                    [PSCustomObject]@{ __Progress = $true; FrontDoorName = $fd.Name; DomainCount = 0; Error = $_.Exception.Message }
+                }
+            } | ForEach-Object {
+                if ($_.PSObject.Properties['__Progress']) {
+                    $processedCount++
+                    if (($processedCount % $progressInterval -eq 0) -or ($processedCount -eq $standardPremiumFDs.Count)) {
+                        $errMsg = if ($_.Error) { " (Error: $($_.Error))" } else { "" }
+                        Write-Host "    Processed $processedCount/$($standardPremiumFDs.Count): $($_.FrontDoorName) -> $($_.DomainCount) domain(s)$errMsg" -ForegroundColor DarkGray
+                    }
+                } else {
+                    $allResults.Add($_)
+                }
             }
-            Write-Host ""
+            Write-Host "    Completed Standard/Premium processing." -ForegroundColor Green
+        }
+        
+        # Process Classic Front Doors with parallel TLS probing
+        if ($classicFDs.Count -gt 0) {
+            Write-Host "  Processing $($classicFDs.Count) Classic Front Door(s)..." -ForegroundColor Cyan
+            
+            # First, enumerate all Classic FD endpoints (requires Az context switching, done sequentially)
+            $classicEndpoints = [System.Collections.Generic.List[PSCustomObject]]::new()
+            
+            # Group by subscription to minimize context switches
+            $classicBySubscription = $classicFDs | Group-Object SubscriptionId
+            foreach ($subGroup in $classicBySubscription) {
+                try {
+                    $null = Set-AzContext -Subscription $subGroup.Name -ErrorAction Stop
+                    $ctx = Get-AzContext
+                    
+                    foreach ($fd in $subGroup.Group) {
+                        try {
+                            $endpoints = Get-AzFrontDoorFrontendEndpoint -FrontDoorName $fd.Name -ResourceGroupName $fd.ResourceGroupName -ErrorAction Stop
+                            foreach ($ep in $endpoints) {
+                                $classicEndpoints.Add([PSCustomObject]@{
+                                    SubscriptionId     = $ctx.Subscription.Id
+                                    SubscriptionName   = $ctx.Subscription.Name
+                                    FrontDoorName      = $fd.Name
+                                    ResourceGroupName  = $fd.ResourceGroupName
+                                    HostName           = $ep.HostName ?? $ep.Name
+                                    CertificateSource  = $ep.CertificateSource
+                                    ProvisioningState  = $ep.CustomHttpsProvisioningState
+                                    KeyVaultName       = if ($ep.Vault) { ($ep.Vault -split '/')[-1] } else { $null }
+                                    KeyVaultSecretName = $ep.SecretName
+                                })
+                            }
+                        } catch {
+                            Write-Host "    Warning: Failed to get endpoints for $($fd.Name): $($_.Exception.Message)" -ForegroundColor Yellow
+                        }
+                    }
+                } catch {
+                    Write-Host "    Warning: Failed to switch to subscription $($subGroup.Name): $($_.Exception.Message)" -ForegroundColor Yellow
+                }
+            }
+            
+            Write-Host "    Found $($classicEndpoints.Count) Classic endpoint(s). Fetching certificates in parallel (TlsThrottleLimit=$TlsThrottleLimit)..." -ForegroundColor Cyan
+            
+            # Now probe TLS certificates in parallel
+            if ($classicEndpoints.Count -gt 0) {
+                $tlsProgressInterval = Get-ProgressInterval -TotalCount $classicEndpoints.Count
+                $tlsProcessedCount = 0
+                $proxyUri = $script:ProxyUri  # Capture for $using:
+                $tlsTimeout = $TlsTimeoutMs
+                
+                $classicEndpoints | ForEach-Object -ThrottleLimit $TlsThrottleLimit -Parallel {
+                    $ep = $_
+                    $proxy = $using:proxyUri
+                    $timeout = $using:tlsTimeout
+                    $warnDays = $using:WarningDays
+                    
+                    $expiryDate = $null
+                    $subject = $null
+                    $errorMsg = $null
+                    
+                    # Inline TLS certificate fetching (functions don't inherit in parallel runspaces)
+                    try {
+                        $tcpClient = [System.Net.Sockets.TcpClient]::new()
+                        $tcpClient.SendTimeout = $timeout
+                        $tcpClient.ReceiveTimeout = $timeout
+                        
+                        if ($proxy) {
+                            # Connect via proxy with HTTP CONNECT tunnel
+                            $tcpClient.Connect($proxy.Host, $proxy.Port)
+                            $networkStream = $tcpClient.GetStream()
+                            
+                            $writer = [System.IO.StreamWriter]::new($networkStream, [System.Text.Encoding]::ASCII)
+                            $writer.AutoFlush = $true
+                            $reader = [System.IO.StreamReader]::new($networkStream, [System.Text.Encoding]::ASCII)
+                            
+                            $writer.WriteLine("CONNECT $($ep.HostName):443 HTTP/1.1")
+                            $writer.WriteLine("Host: $($ep.HostName):443")
+                            $writer.WriteLine("")
+                            
+                            $response = $reader.ReadLine()
+                            if ($response -notmatch "^HTTP/\d\.\d 200") {
+                                throw "Proxy CONNECT failed: $response"
+                            }
+                            while ($true) {
+                                $line = $reader.ReadLine()
+                                if ([string]::IsNullOrEmpty($line)) { break }
+                            }
+                            
+                            $sslStream = [System.Net.Security.SslStream]::new(
+                                $networkStream, $false,
+                                { param($s, $certificate, $chain, $sslPolicyErrors) return $true }
+                            )
+                        } else {
+                            # Direct connection
+                            $tcpClient.Connect($ep.HostName, 443)
+                            $sslStream = [System.Net.Security.SslStream]::new(
+                                $tcpClient.GetStream(), $false,
+                                { param($s, $certificate, $chain, $sslPolicyErrors) return $true }
+                            )
+                        }
+                        
+                        $sslStream.AuthenticateAsClient($ep.HostName)
+                        $cert = $sslStream.RemoteCertificate
+                        
+                        if ($cert) {
+                            $x509 = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($cert)
+                            $expiryDate = $x509.NotAfter
+                            $subject = $x509.Subject
+                        }
+                        
+                        $sslStream.Dispose()
+                        $tcpClient.Dispose()
+                    } catch {
+                        $innerEx = $_.Exception.InnerException
+                        while ($innerEx -and $innerEx.InnerException) { $innerEx = $innerEx.InnerException }
+                        $errorMsg = if ($innerEx) { $innerEx.Message } else { $_.Exception.Message }
+                    }
+                    
+                    # Calculate expiration status
+                    $expiryDisplay = $null
+                    $expiryStatus = 'OK'
+                    if ($expiryDate) {
+                        $expiryDisplay = $expiryDate.ToString()
+                        $daysUntilExpiry = ($expiryDate - (Get-Date)).Days
+                        $expiryStatus = if ($daysUntilExpiry -lt 0) { 'EXPIRED' } elseif ($daysUntilExpiry -le $warnDays) { 'WARNING' } else { 'OK' }
+                    }
+                    
+                    [PSCustomObject]@{
+                        SubscriptionId     = $ep.SubscriptionId
+                        SubscriptionName   = $ep.SubscriptionName
+                        FrontDoorName      = $ep.FrontDoorName
+                        FrontDoorType      = 'Classic'
+                        Domain             = $ep.HostName
+                        CertificateType    = $ep.CertificateSource
+                        ProvisioningState  = $ep.ProvisioningState
+                        Subject            = $subject
+                        ExpirationDate     = $expiryDisplay
+                        ExpirationStatus   = $expiryStatus
+                        KeyVaultName       = $ep.KeyVaultName
+                        KeyVaultSecretName = $ep.KeyVaultSecretName
+                        TlsError           = $errorMsg
+                        __Progress         = $true
+                    }
+                } | ForEach-Object {
+                    $tlsProcessedCount++
+                    if (($tlsProcessedCount % $tlsProgressInterval -eq 0) -or ($tlsProcessedCount -eq $classicEndpoints.Count)) {
+                        $status = if ($_.TlsError) { "Error" } else { "OK" }
+                        Write-Host "    TLS probed $tlsProcessedCount/$($classicEndpoints.Count): $($_.Domain) -> $status" -ForegroundColor DarkGray
+                    }
+                    
+                    # Remove internal properties and add to results
+                    $result = [PSCustomObject]@{
+                        SubscriptionId     = $_.SubscriptionId
+                        SubscriptionName   = $_.SubscriptionName
+                        FrontDoorName      = $_.FrontDoorName
+                        FrontDoorType      = $_.FrontDoorType
+                        Domain             = $_.Domain
+                        CertificateType    = $_.CertificateType
+                        ProvisioningState  = $_.ProvisioningState
+                        Subject            = $_.Subject
+                        ExpirationDate     = $_.ExpirationDate
+                        ExpirationStatus   = $_.ExpirationStatus
+                        KeyVaultName       = $_.KeyVaultName
+                        KeyVaultSecretName = $_.KeyVaultSecretName
+                    }
+                    $allResults.Add($result)
+                }
+                Write-Host "    Completed Classic TLS probing." -ForegroundColor Green
+            }
         }
     }
 }
