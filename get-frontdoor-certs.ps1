@@ -1254,12 +1254,22 @@ elseif ($PSCmdlet.ParameterSetName -eq 'ScanTenant') {
             
             # Group by subscription to minimize context switches
             $classicBySubscription = $classicFDs | Group-Object SubscriptionId
+            $subIndex = 0
+            $totalSubs = $classicBySubscription.Count
+            $classicFDsProcessed = 0
+            
+            Write-Host "    Enumerating endpoints across $totalSubs subscription(s)..." -ForegroundColor Cyan
+            
             foreach ($subGroup in $classicBySubscription) {
+                $subIndex++
                 try {
                     $null = Set-AzContext -Subscription $subGroup.Name -ErrorAction Stop
                     $ctx = Get-AzContext
+                    $subName = $ctx.Subscription.Name
+                    $fdsInSub = $subGroup.Group.Count
                     
                     foreach ($fd in $subGroup.Group) {
+                        $classicFDsProcessed++
                         try {
                             $endpoints = Get-AzFrontDoorFrontendEndpoint -FrontDoorName $fd.Name -ResourceGroupName $fd.ResourceGroupName -ErrorAction Stop
                             foreach ($ep in $endpoints) {
@@ -1276,18 +1286,20 @@ elseif ($PSCmdlet.ParameterSetName -eq 'ScanTenant') {
                                 })
                             }
                         } catch {
-                            Write-Host "    Warning: Failed to get endpoints for $($fd.Name): $($_.Exception.Message)" -ForegroundColor Yellow
+                            Write-Host "      Warning: Failed to get endpoints for $($fd.Name): $($_.Exception.Message)" -ForegroundColor Yellow
                         }
                     }
+                    Write-Host "      [$subIndex/$totalSubs] $subName : $fdsInSub FD(s), $($classicEndpoints.Count) endpoint(s) total" -ForegroundColor DarkGray
                 } catch {
-                    Write-Host "    Warning: Failed to switch to subscription $($subGroup.Name): $($_.Exception.Message)" -ForegroundColor Yellow
+                    Write-Host "      [$subIndex/$totalSubs] Warning: Failed to switch to subscription $($subGroup.Name): $($_.Exception.Message)" -ForegroundColor Yellow
                 }
             }
             
-            Write-Host "    Found $($classicEndpoints.Count) Classic endpoint(s). Fetching certificates in parallel (TlsThrottleLimit=$TlsThrottleLimit)..." -ForegroundColor Cyan
+            Write-Host "    Enumeration complete: $($classicEndpoints.Count) endpoint(s) from $classicFDsProcessed Classic FD(s)" -ForegroundColor Green
             
             # Now probe TLS certificates in parallel
             if ($classicEndpoints.Count -gt 0) {
+                Write-Host "    Probing TLS certificates in parallel (TlsThrottleLimit=$TlsThrottleLimit, timeout=${TlsTimeoutMs}ms)..." -ForegroundColor Cyan
                 $tlsProgressInterval = Get-ProgressInterval -TotalCount $classicEndpoints.Count
                 $tlsProcessedCount = 0
                 $proxyUri = $script:ProxyUri  # Capture for $using:
