@@ -5,8 +5,8 @@
 .DESCRIPTION
     This script extracts certificate information from Azure Front Door deployments, supporting
     both Classic and Standard/Premium Front Door profiles. It displays certificate expiration
-    dates with status indicators, shows provisioning and validation states, and can export
-    results to CSV for reporting.
+    dates with status indicators, shows provisioning and validation states, reports classic-to-
+    Standard/Premium migration links when present, and can export results to CSV for reporting.
 
     The script supports both Azure-managed certificates and custom certificates from Key Vault,
     providing detailed information including certificate subject, issuing CA, provisioning state,
@@ -90,7 +90,7 @@
     The script outputs a formatted table showing certificate details and returns an array of
     custom objects containing certificate information, including issuer, issuing CA, and
     certificate-chain details. If ExportCsvPath is specified, results are also exported to a
-    CSV file using a stable column set.
+    CSV file using a stable column set that includes migration source/target resource IDs.
 
 .EXAMPLE
     .\get-frontdoor-certs.ps1 -ScanFrontDoor "my-frontdoor-profile" -ResourceGroupName "my-resource-group"
@@ -158,7 +158,7 @@
     
     Module Requirements:
     - Az.Accounts module is required for all modes
-    - Az.FrontDoor module is required for Classic Front Door enumeration in subscription mode
+    - Az.FrontDoor module is required for Classic single-profile scans
     
     Performance:
     - Tenant mode uses parallel processing for faster scanning
@@ -923,6 +923,72 @@ function Test-IsDefaultAzureFrontDoorHostname {
     return $HostName.EndsWith('.azurefd.net', [System.StringComparison]::OrdinalIgnoreCase)
 }
 
+# Maps each Standard/Premium custom-domain resource ID to the endpoint names whose routes reference it.
+function Get-AfdCustomDomainEndpointAssociations {
+    param(
+        [Parameter(Mandatory)]
+        [string]$SubscriptionId,
+
+        [Parameter(Mandatory)]
+        [string]$ResourceGroupName,
+
+        [Parameter(Mandatory)]
+        [string]$ProfileName,
+
+        [Parameter(Mandatory)]
+        [string]$ApiVersion,
+
+        [Parameter(Mandatory)]
+        [int]$RestRetryCount,
+
+        [Parameter(Mandatory)]
+        [int]$RetryBaseDelayMs
+    )
+
+    $associationSets = @{}
+    $pathEndpoints = "/subscriptions/$SubscriptionId/resourceGroups/$ResourceGroupName/providers/Microsoft.Cdn/profiles/$ProfileName/afdEndpoints?api-version=$ApiVersion"
+    $endpointsResp = Invoke-WithRetry -Action {
+        Invoke-AzRest -Path $pathEndpoints -Method GET -ErrorAction Stop
+    } -OperationName "endpoint lookup for $ProfileName" -Category Rest -MaxAttempts $RestRetryCount -BaseDelayMs $RetryBaseDelayMs
+    $afdEndpoints = @(($endpointsResp.Content | ConvertFrom-Json).value)
+
+    foreach ($afdEndpoint in $afdEndpoints) {
+        $endpointName = [string]$afdEndpoint.name
+        if ([string]::IsNullOrWhiteSpace($endpointName)) {
+            continue
+        }
+
+        $pathRoutes = "/subscriptions/$SubscriptionId/resourceGroups/$ResourceGroupName/providers/Microsoft.Cdn/profiles/$ProfileName/afdEndpoints/$endpointName/routes?api-version=$ApiVersion"
+        $routesResp = Invoke-WithRetry -Action {
+            Invoke-AzRest -Path $pathRoutes -Method GET -ErrorAction Stop
+        } -OperationName "route lookup for $ProfileName/$endpointName" -Category Rest -MaxAttempts $RestRetryCount -BaseDelayMs $RetryBaseDelayMs
+        $routes = @(($routesResp.Content | ConvertFrom-Json).value)
+
+        foreach ($route in $routes) {
+            foreach ($customDomainRef in @($route.properties.customDomains)) {
+                $domainRefId = [string]$customDomainRef.id
+                if ([string]::IsNullOrWhiteSpace($domainRefId)) {
+                    continue
+                }
+
+                $domainKey = $domainRefId.ToLowerInvariant()
+                if (-not $associationSets.ContainsKey($domainKey)) {
+                    $associationSets[$domainKey] = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+                }
+
+                $null = $associationSets[$domainKey].Add($endpointName)
+            }
+        }
+    }
+
+    $associationMap = @{}
+    foreach ($domainKey in $associationSets.Keys) {
+        $associationMap[$domainKey] = (@($associationSets[$domainKey] | Sort-Object) -join ' | ')
+    }
+
+    return $associationMap
+}
+
 # Returns a stable column projection for CSV export and GridView, even when mixed result objects
 # do not all expose the same properties.
 function Get-ResultExportColumns {
@@ -931,6 +997,9 @@ function Get-ResultExportColumns {
         'SubscriptionName',
         'FrontDoorName',
         'FrontDoorType',
+        'MigrationSourceResourceId',
+        'MigrationTargetResourceId',
+        'EndpointAssociation',
         'Domain',
         'CertificateType',
         'ProvisioningState',
@@ -948,6 +1017,93 @@ function Get-ResultExportColumns {
         'KeyVaultName',
         'KeyVaultSecretName'
     )
+}
+
+# Extracts classic-to-Standard/Premium migration links from ARM resource metadata.
+function Get-FrontDoorMigrationMetadata {
+    param(
+        [Parameter(Mandatory = $false)]
+        [object]$Resource,
+
+        [Parameter(Mandatory)]
+        [ValidateSet('Standard/Premium', 'Classic')]
+        [string]$FrontDoorType
+    )
+
+    $migrationInfo = @{
+        MigrationSourceResourceId = $null
+        MigrationTargetResourceId = $null
+    }
+
+    if (-not $Resource) {
+        return $migrationInfo
+    }
+
+    $properties = $Resource.Properties
+    if (-not $properties) {
+        $properties = $Resource.properties
+    }
+
+    if ($properties -is [string]) {
+        try {
+            $properties = $properties | ConvertFrom-Json -Depth 20
+        }
+        catch {
+            $properties = $null
+        }
+    }
+
+    if (-not $properties) {
+        return $migrationInfo
+    }
+
+    $extendedProperties = $properties.extendedProperties
+    if ($extendedProperties -is [string]) {
+        try {
+            $extendedProperties = $extendedProperties | ConvertFrom-Json -Depth 10
+        }
+        catch {
+            $extendedProperties = $null
+        }
+    }
+
+    if (-not $extendedProperties) {
+        return $migrationInfo
+    }
+
+    if ($FrontDoorType -eq 'Standard/Premium') {
+        $migrationInfo.MigrationSourceResourceId = [string]$extendedProperties.MigratedFrom
+        if ([string]::IsNullOrWhiteSpace($migrationInfo.MigrationSourceResourceId)) {
+            $migrationInfo.MigrationSourceResourceId = $null
+        }
+    }
+    else {
+        $migrationInfo.MigrationTargetResourceId = [string]$extendedProperties.MigratedTo
+        if ([string]::IsNullOrWhiteSpace($migrationInfo.MigrationTargetResourceId)) {
+            $migrationInfo.MigrationTargetResourceId = $null
+        }
+    }
+
+    return $migrationInfo
+}
+
+# Reduces an ARM resource ID to the terminal Front Door name for compact console output.
+function Get-FrontDoorMigrationDisplayName {
+    param(
+        [Parameter(Mandatory = $false)]
+        [string]$ResourceId
+    )
+
+    if ([string]::IsNullOrWhiteSpace($ResourceId)) {
+        return $null
+    }
+
+    $segments = $ResourceId.TrimEnd('/') -split '/'
+    if ($segments.Count -gt 0) {
+        return $segments[-1]
+    }
+
+    return $ResourceId
 }
 
 # Creates the CSV parent directory when -ExportCsvPath points to a folder that does not exist yet.
@@ -1012,12 +1168,16 @@ function Get-DynamicColumnWidths {
         Subscription = 15
         FrontDoor = 15
         FDType = 7
+        MigSource = 12
+        MigTarget = 12
         Domain = 25
+        Endpoint = 14
         CertType = 8
         ProvState = 10
         ValState = 10
         Subject = 10
         IssuingCA = 12
+        RootCA = 12
         ExpirationDate = 22
         KVName = 15
         KVSecret = 8
@@ -1028,21 +1188,25 @@ function Get-DynamicColumnWidths {
         Subscription = 25
         FrontDoor = 26
         FDType = 7
+        MigSource = 18
+        MigTarget = 18
         Domain = 38
+        Endpoint = 22
         CertType = 11
         ProvState = 12
         ValState = 12
         Subject = 25
         IssuingCA = 24
+        RootCA = 24
         ExpirationDate = 22
         KVName = 22
         KVSecret = 20
     }
     
     # Show validation state only when Standard/Premium rows are present.
-    $columns = @('Subscription', 'FrontDoor', 'FDType', 'Domain', 'CertType', 'ProvState')
+    $columns = @('Subscription', 'FrontDoor', 'FDType', 'MigSource', 'MigTarget', 'Domain', 'Endpoint', 'CertType', 'ProvState')
     if ($hasValidationState) { $columns += 'ValState' }
-    $columns += @('Subject', 'IssuingCA', 'ExpirationDate', 'KVName', 'KVSecret')
+    $columns += @('Subject', 'IssuingCA', 'RootCA', 'ExpirationDate', 'KVName', 'KVSecret')
     
     $minRequired = ($columns | ForEach-Object { $minWidths[$_] + 1 } | Measure-Object -Sum).Sum
     
@@ -1123,16 +1287,19 @@ function Get-AllFrontDoorsInSubscription {
     # Get Standard/Premium Front Doors (Microsoft.Cdn/profiles with AzureFrontDoor SKU)
     if ($TypeFilter -eq 'All' -or $TypeFilter -eq 'StandardPremium') {
         try {
-            $cdnProfiles = Get-AzResource -ResourceType "Microsoft.Cdn/profiles" -ErrorAction SilentlyContinue
+            $cdnProfiles = Get-AzResource -ResourceType "Microsoft.Cdn/profiles" -ExpandProperties -ErrorAction SilentlyContinue
             $afdProfiles = $cdnProfiles | Where-Object { 
                 $_.Sku.Name -eq 'Standard_AzureFrontDoor' -or $_.Sku.Name -eq 'Premium_AzureFrontDoor'
             }
             
             foreach ($afdProfile in $afdProfiles) {
+                $migrationInfo = Get-FrontDoorMigrationMetadata -Resource $afdProfile -FrontDoorType 'Standard/Premium'
                 $frontDoors += [PSCustomObject]@{
-                    Name = $afdProfile.Name
-                    ResourceGroupName = $afdProfile.ResourceGroupName
-                    Type = 'Standard/Premium'
+                    Name                      = $afdProfile.Name
+                    ResourceGroupName         = $afdProfile.ResourceGroupName
+                    Type                      = 'Standard/Premium'
+                    MigrationSourceResourceId = $migrationInfo.MigrationSourceResourceId
+                    MigrationTargetResourceId = $migrationInfo.MigrationTargetResourceId
                 }
             }
             Write-Host "    Found $($afdProfiles.Count) Standard/Premium Front Door(s)" -ForegroundColor Green
@@ -1145,12 +1312,15 @@ function Get-AllFrontDoorsInSubscription {
     # Get Classic Front Doors
     if ($TypeFilter -eq 'All' -or $TypeFilter -eq 'Classic') {
         try {
-            $classicFDs = Get-AzFrontDoor -ErrorAction SilentlyContinue
+            $classicFDs = Get-AzResource -ResourceType "Microsoft.Network/frontdoors" -ExpandProperties -ErrorAction SilentlyContinue
             foreach ($fd in $classicFDs) {
+                $migrationInfo = Get-FrontDoorMigrationMetadata -Resource $fd -FrontDoorType 'Classic'
                 $frontDoors += [PSCustomObject]@{
-                    Name = $fd.Name
-                    ResourceGroupName = $fd.ResourceGroupName
-                    Type = 'Classic'
+                    Name                      = $fd.Name
+                    ResourceGroupName         = $fd.ResourceGroupName
+                    Type                      = 'Classic'
+                    MigrationSourceResourceId = $migrationInfo.MigrationSourceResourceId
+                    MigrationTargetResourceId = $migrationInfo.MigrationTargetResourceId
                 }
             }
             Write-Host "    Found $($classicFDs.Count) Classic Front Door(s)" -ForegroundColor Green
@@ -1193,9 +1363,12 @@ function Get-AllFrontDoorsInTenant {
 resources
 | where type in~ ('microsoft.cdn/profiles', 'microsoft.network/frontdoors')
 | extend skuName = tostring(sku.name)
+    | extend ext = todynamic(properties.extendedProperties)
 | extend deploymentModel = case(type =~ 'microsoft.network/frontdoors', 'Classic', 'Standard/Premium')
+    | extend migrationSourceResourceId = iff(type =~ 'microsoft.cdn/profiles', tostring(ext.MigratedFrom), '')
+    | extend migrationTargetResourceId = iff(type =~ 'microsoft.network/frontdoors', tostring(ext.MigratedTo), '')
 | where type =~ 'microsoft.network/frontdoors' or skuName in~ ('Standard_AzureFrontDoor', 'Premium_AzureFrontDoor')
-| project name, resourceGroup, subscriptionId, type, deploymentModel
+    | project name, resourceGroup, subscriptionId, type, deploymentModel, migrationSourceResourceId, migrationTargetResourceId
 | order by subscriptionId, name
 "@
 
@@ -1204,7 +1377,9 @@ resources
 resources
 | where type == 'microsoft.cdn/profiles'
 | where sku.name in ('Standard_AzureFrontDoor', 'Premium_AzureFrontDoor')
-| project name, resourceGroup, subscriptionId, type
+    | extend ext = todynamic(properties.extendedProperties)
+    | extend migrationSourceResourceId = tostring(ext.MigratedFrom)
+    | project name, resourceGroup, subscriptionId, type, migrationSourceResourceId
 | order by subscriptionId, name
 "@
 
@@ -1212,7 +1387,9 @@ resources
     $queryClassic = @"
 resources
 | where type == 'microsoft.network/frontdoors'
-| project name, resourceGroup, subscriptionId, type
+    | extend ext = todynamic(properties.extendedProperties)
+    | extend migrationTargetResourceId = tostring(ext.MigratedTo)
+    | project name, resourceGroup, subscriptionId, type, migrationTargetResourceId
 | order by subscriptionId, name
 "@
 
@@ -1233,10 +1410,12 @@ resources
                       else { 'Standard/Premium' }
             
             $frontDoors.Add([PSCustomObject]@{
-                Name              = $result.name
-                ResourceGroupName = $result.resourceGroup
-                SubscriptionId    = $result.subscriptionId
-                Type              = $fdType
+                Name                      = $result.name
+                ResourceGroupName         = $result.resourceGroup
+                SubscriptionId            = $result.subscriptionId
+                Type                      = $fdType
+                MigrationSourceResourceId = if ([string]::IsNullOrWhiteSpace([string]$result.migrationSourceResourceId)) { $null } else { [string]$result.migrationSourceResourceId }
+                MigrationTargetResourceId = if ([string]::IsNullOrWhiteSpace([string]$result.migrationTargetResourceId)) { $null } else { [string]$result.migrationTargetResourceId }
             })
         }
         
@@ -1287,9 +1466,14 @@ function Get-FrontDoorCertificates {
 
     # Try to find Standard/Premium Front Door first
     if ($ResourceGroupName) {
-        $fd = Get-AzResource -Name $FrontDoorName -ResourceGroupName $ResourceGroupName -ResourceType "Microsoft.Cdn/profiles" -ErrorAction SilentlyContinue
+        $fd = Get-AzResource -Name $FrontDoorName -ResourceGroupName $ResourceGroupName -ResourceType "Microsoft.Cdn/profiles" -ExpandProperties -ErrorAction SilentlyContinue
     } else {
-        $fd = Get-AzResource -Name $FrontDoorName -ResourceType "Microsoft.Cdn/profiles" -ErrorAction SilentlyContinue
+        $fd = Get-AzResource -Name $FrontDoorName -ResourceType "Microsoft.Cdn/profiles" -ExpandProperties -ErrorAction SilentlyContinue
+    }
+
+    $migrationInfo = @{
+        MigrationSourceResourceId = $null
+        MigrationTargetResourceId = $null
     }
 
     # If not found, try Classic Front Door
@@ -1309,6 +1493,7 @@ function Get-FrontDoorCertificates {
     } else {
         Write-Host "  Found Standard/Premium Front Door: $($fd.Name) in resource group: $($fd.ResourceGroupName)" -ForegroundColor Green
         $isClassic = $false
+        $migrationInfo = Get-FrontDoorMigrationMetadata -Resource $fd -FrontDoorType 'Standard/Premium'
     }
 
     if ($isClassic) {
@@ -1323,6 +1508,9 @@ function Get-FrontDoorCertificates {
         if (-not $classicRg -and $ResourceGroupName) {
             $classicRg = $ResourceGroupName
         }
+
+        $fdClassicResource = Get-AzResource -Name $FrontDoorName -ResourceGroupName $classicRg -ResourceType "Microsoft.Network/frontdoors" -ExpandProperties -ErrorAction SilentlyContinue
+        $migrationInfo = Get-FrontDoorMigrationMetadata -Resource $fdClassicResource -FrontDoorType 'Classic'
         
         # Get all frontend endpoints (custom domains) from Classic Front Door using explicit parameters
         try {
@@ -1357,6 +1545,7 @@ function Get-FrontDoorCertificates {
             
             foreach ($ep in $eligibleEndpoints) {
                 $domainName = $ep.HostName ?? $ep.Name
+                $endpointAssociation = $ep.Name
                 
                 Write-Host "    Fetching certificate for: $domainName..." -NoNewline
                 
@@ -1419,6 +1608,9 @@ function Get-FrontDoorCertificates {
                     SubscriptionName   = $context.Subscription.Name
                     FrontDoorName      = $FrontDoorName
                     FrontDoorType      = 'Classic'
+                    MigrationSourceResourceId = $migrationInfo.MigrationSourceResourceId
+                    MigrationTargetResourceId = $migrationInfo.MigrationTargetResourceId
+                    EndpointAssociation = $endpointAssociation
                     Domain             = $domainName
                     CertificateType    = $certSource
                     ProvisioningState  = $provisioningState
@@ -1488,6 +1680,20 @@ function Get-FrontDoorCertificates {
 
             Write-Host "  Found $($eligibleDomains.Count) custom domain(s). Processing..."
 
+            $domainEndpointAssociations = @{}
+            try {
+                $domainEndpointAssociations = Get-AfdCustomDomainEndpointAssociations `
+                    -SubscriptionId $subscriptionId `
+                    -ResourceGroupName $rgName `
+                    -ProfileName $fdName `
+                    -ApiVersion $ApiVersion `
+                    -RestRetryCount $RestRetryCount `
+                    -RetryBaseDelayMs $RetryBaseDelayMs
+            }
+            catch {
+                Write-Host "  Failed to resolve endpoint associations for ${fdName}: $($_.Exception.Message)" -ForegroundColor Yellow
+            }
+
             foreach ($d in $eligibleDomains) {
                 # Initialize fields
                 $certSource = $null
@@ -1506,6 +1712,14 @@ function Get-FrontDoorCertificates {
                 $digiCertIssued = $null
                 
                 $domainName = $d.properties.hostName ?? $d.name
+                $domainAssociation = 'Unassociated'
+                $domainResourceId = [string]$d.id
+                if (-not [string]::IsNullOrWhiteSpace($domainResourceId)) {
+                    $domainKey = $domainResourceId.ToLowerInvariant()
+                    if ($domainEndpointAssociations.ContainsKey($domainKey) -and -not [string]::IsNullOrWhiteSpace([string]$domainEndpointAssociations[$domainKey])) {
+                        $domainAssociation = [string]$domainEndpointAssociations[$domainKey]
+                    }
+                }
 
                 # Get provisioning state
                 if ($d.properties.provisioningState) { $provisioningState = $d.properties.provisioningState }
@@ -1597,6 +1811,9 @@ function Get-FrontDoorCertificates {
                     SubscriptionName   = $context.Subscription.Name
                     FrontDoorName      = $FrontDoorName
                     FrontDoorType      = 'Standard/Premium'
+                    MigrationSourceResourceId = $migrationInfo.MigrationSourceResourceId
+                    MigrationTargetResourceId = $migrationInfo.MigrationTargetResourceId
+                    EndpointAssociation = $domainAssociation
                     Domain             = $domainName
                     CertificateType    = $certSource
                     ProvisioningState  = $provisioningState
@@ -2034,6 +2251,66 @@ elseif ($PSCmdlet.ParameterSetName -eq 'ScanTenant') {
                     )
 
                     if (-not $Certificate) {
+
+                function Get-DomainEndpointAssociationsLocal {
+                    param(
+                        [Parameter(Mandatory)]
+                        [string]$ProfileBaseUri,
+
+                        [Parameter(Mandatory)]
+                        [string]$ApiVersion,
+
+                        [Parameter(Mandatory)]
+                        [hashtable]$Headers,
+
+                        [Parameter(Mandatory)]
+                        [int]$MaxAttempts,
+
+                        [Parameter(Mandatory)]
+                        [int]$BaseDelayMs
+                    )
+
+                    $associationSets = @{}
+                    $endpointsUri = "$ProfileBaseUri/afdEndpoints?api-version=$ApiVersion"
+                    $endpointsResp = Invoke-WithRetryLocal -Action {
+                        Invoke-RestMethod -Method Get -Uri $endpointsUri -Headers $Headers -ErrorAction Stop
+                    } -Category Rest -MaxAttempts $MaxAttempts -BaseDelayMs $BaseDelayMs
+
+                    foreach ($afdEndpoint in @($endpointsResp.value)) {
+                        $endpointName = [string]$afdEndpoint.name
+                        if ([string]::IsNullOrWhiteSpace($endpointName)) {
+                            continue
+                        }
+
+                        $routesUri = "$ProfileBaseUri/afdEndpoints/$endpointName/routes?api-version=$ApiVersion"
+                        $routesResp = Invoke-WithRetryLocal -Action {
+                            Invoke-RestMethod -Method Get -Uri $routesUri -Headers $Headers -ErrorAction Stop
+                        } -Category Rest -MaxAttempts $MaxAttempts -BaseDelayMs $BaseDelayMs
+
+                        foreach ($route in @($routesResp.value)) {
+                            foreach ($customDomainRef in @($route.properties.customDomains)) {
+                                $domainRefId = [string]$customDomainRef.id
+                                if ([string]::IsNullOrWhiteSpace($domainRefId)) {
+                                    continue
+                                }
+
+                                $domainKey = $domainRefId.ToLowerInvariant()
+                                if (-not $associationSets.ContainsKey($domainKey)) {
+                                    $associationSets[$domainKey] = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+                                }
+
+                                $null = $associationSets[$domainKey].Add($endpointName)
+                            }
+                        }
+                    }
+
+                    $associationMap = @{}
+                    foreach ($domainKey in $associationSets.Keys) {
+                        $associationMap[$domainKey] = (@($associationSets[$domainKey] | Sort-Object) -join ' | ')
+                    }
+
+                    return $associationMap
+                }
                         return @{
                             Subject                = $null
                             Issuer                 = $IssuerString
@@ -2121,6 +2398,13 @@ elseif ($PSCmdlet.ParameterSetName -eq 'ScanTenant') {
                         Invoke-RestMethod -Method Get -Uri $domainsUri -Headers $hdrs -ErrorAction Stop
                     } -Category Rest -MaxAttempts $restRetryCount -BaseDelayMs $retryBaseDelayMs
                     $domains = @($domainsResp.value)
+                    $domainEndpointAssociations = @{}
+                    try {
+                        $domainEndpointAssociations = Get-DomainEndpointAssociationsLocal -ProfileBaseUri $baseUri -ApiVersion $apiVer -Headers $hdrs -MaxAttempts $restRetryCount -BaseDelayMs $retryBaseDelayMs
+                    }
+                    catch {
+                        $domainEndpointAssociations = @{}
+                    }
                     $includedDomainCount = 0
 
                     foreach ($d in $domains) {
@@ -2144,6 +2428,14 @@ elseif ($PSCmdlet.ParameterSetName -eq 'ScanTenant') {
                         $digiCertIssued = $null
                         $keyVaultName = $null
                         $keyVaultSecretName = $null
+                        $domainAssociation = 'Unassociated'
+                        $domainResourceId = [string]$d.id
+                        if (-not [string]::IsNullOrWhiteSpace($domainResourceId)) {
+                            $domainKey = $domainResourceId.ToLowerInvariant()
+                            if ($domainEndpointAssociations.ContainsKey($domainKey) -and -not [string]::IsNullOrWhiteSpace([string]$domainEndpointAssociations[$domainKey])) {
+                                $domainAssociation = [string]$domainEndpointAssociations[$domainKey]
+                            }
+                        }
                         
                         # Prefer certificate metadata from ARM, then enrich it with a live TLS probe when available.
                         if ($d.properties.tlsSettings) {
@@ -2219,6 +2511,9 @@ elseif ($PSCmdlet.ParameterSetName -eq 'ScanTenant') {
                             SubscriptionId     = $fd.SubscriptionId
                             SubscriptionName   = $subLookup[$fd.SubscriptionId] ?? $fd.SubscriptionId
                             FrontDoorName      = $fd.Name
+                            MigrationSourceResourceId = $fd.MigrationSourceResourceId
+                            MigrationTargetResourceId = $fd.MigrationTargetResourceId
+                            EndpointAssociation = $domainAssociation
                             FrontDoorType      = 'Standard/Premium'
                             Domain             = $domainName
                             CertificateType    = $certSource
@@ -2412,6 +2707,9 @@ elseif ($PSCmdlet.ParameterSetName -eq 'ScanTenant') {
                             SubscriptionId     = $fd.SubscriptionId
                             SubscriptionName   = $subLookup[$fd.SubscriptionId] ?? $fd.SubscriptionId
                             FrontDoorName      = $fd.Name
+                            MigrationSourceResourceId = $fd.MigrationSourceResourceId
+                            MigrationTargetResourceId = $fd.MigrationTargetResourceId
+                            EndpointAssociation = [string]$ep.name
                             HostName           = $hostName
                             CertificateSource  = $certificateSource
                             ProvisioningState  = [string]$ep.properties.customHttpsProvisioningState
@@ -2792,6 +3090,9 @@ elseif ($PSCmdlet.ParameterSetName -eq 'ScanTenant') {
                         SubscriptionId     = $ep.SubscriptionId
                         SubscriptionName   = $ep.SubscriptionName
                         FrontDoorName      = $ep.FrontDoorName
+                        MigrationSourceResourceId = $ep.MigrationSourceResourceId
+                        MigrationTargetResourceId = $ep.MigrationTargetResourceId
+                        EndpointAssociation = $ep.EndpointAssociation
                         FrontDoorType      = 'Classic'
                         Domain             = $ep.HostName
                         CertificateType    = $ep.CertificateSource
@@ -2841,23 +3142,27 @@ if ($allResults.Count -eq 0) {
     $colSub = $colWidths['Subscription']
     $colFD = $colWidths['FrontDoor']
     $colFDType = $colWidths['FDType']
+    $colMigSource = $colWidths['MigSource']
+    $colMigTarget = $colWidths['MigTarget']
     $colDomain = $colWidths['Domain']
+    $colEndpoint = $colWidths['Endpoint']
     $colCertType = $colWidths['CertType']
     $colProvState = $colWidths['ProvState']
     $colValState = if ($hasValidationState) { $colWidths['ValState'] } else { 0 }
     $colSubject = $colWidths['Subject']
     $colIssuingCA = $colWidths['IssuingCA']
+    $colRootCA = $colWidths['RootCA']
     $colExpiry = $colWidths['ExpirationDate']
     $colKVName = $colWidths['KVName']
     $colKVSecret = $colWidths['KVSecret']
     
     # Display header
     if ($hasValidationState) {
-        Write-Host ("{0,-$colSub} {1,-$colFD} {2,-$colFDType} {3,-$colDomain} {4,-$colCertType} {5,-$colProvState} {6,-$colValState} {7,-$colSubject} {8,-$colIssuingCA} {9,-$colExpiry} {10,-$colKVName} {11}" -f "Subscription", "FrontDoor", "FDType", "Domain", "CertType", "ProvState", "ValState", "Subject", "IssuingCA", "ExpirationDate", "KVName", "KVSecret") -ForegroundColor Cyan
-        Write-Host ("{0,-$colSub} {1,-$colFD} {2,-$colFDType} {3,-$colDomain} {4,-$colCertType} {5,-$colProvState} {6,-$colValState} {7,-$colSubject} {8,-$colIssuingCA} {9,-$colExpiry} {10,-$colKVName} {11}" -f ("-" * $colSub), ("-" * $colFD), ("-" * $colFDType), ("-" * $colDomain), ("-" * $colCertType), ("-" * $colProvState), ("-" * $colValState), ("-" * $colSubject), ("-" * $colIssuingCA), ("-" * $colExpiry), ("-" * $colKVName), ("-" * $colKVSecret)) -ForegroundColor Cyan
+        Write-Host ("{0,-$colSub} {1,-$colFD} {2,-$colFDType} {3,-$colMigSource} {4,-$colMigTarget} {5,-$colDomain} {6,-$colEndpoint} {7,-$colCertType} {8,-$colProvState} {9,-$colValState} {10,-$colSubject} {11,-$colIssuingCA} {12,-$colRootCA} {13,-$colExpiry} {14,-$colKVName} {15}" -f "Subscription", "FrontDoor", "FDType", "MigSource", "MigTarget", "Domain", "Endpoint", "CertType", "ProvState", "ValState", "Subject", "IssuingCA", "RootCA", "ExpirationDate", "KVName", "KVSecret") -ForegroundColor Cyan
+        Write-Host ("{0,-$colSub} {1,-$colFD} {2,-$colFDType} {3,-$colMigSource} {4,-$colMigTarget} {5,-$colDomain} {6,-$colEndpoint} {7,-$colCertType} {8,-$colProvState} {9,-$colValState} {10,-$colSubject} {11,-$colIssuingCA} {12,-$colRootCA} {13,-$colExpiry} {14,-$colKVName} {15}" -f ("-" * $colSub), ("-" * $colFD), ("-" * $colFDType), ("-" * $colMigSource), ("-" * $colMigTarget), ("-" * $colDomain), ("-" * $colEndpoint), ("-" * $colCertType), ("-" * $colProvState), ("-" * $colValState), ("-" * $colSubject), ("-" * $colIssuingCA), ("-" * $colRootCA), ("-" * $colExpiry), ("-" * $colKVName), ("-" * $colKVSecret)) -ForegroundColor Cyan
     } else {
-        Write-Host ("{0,-$colSub} {1,-$colFD} {2,-$colFDType} {3,-$colDomain} {4,-$colCertType} {5,-$colProvState} {6,-$colSubject} {7,-$colIssuingCA} {8,-$colExpiry} {9,-$colKVName} {10}" -f "Subscription", "FrontDoor", "FDType", "Domain", "CertType", "ProvState", "Subject", "IssuingCA", "ExpirationDate", "KVName", "KVSecret") -ForegroundColor Cyan
-        Write-Host ("{0,-$colSub} {1,-$colFD} {2,-$colFDType} {3,-$colDomain} {4,-$colCertType} {5,-$colProvState} {6,-$colSubject} {7,-$colIssuingCA} {8,-$colExpiry} {9,-$colKVName} {10}" -f ("-" * $colSub), ("-" * $colFD), ("-" * $colFDType), ("-" * $colDomain), ("-" * $colCertType), ("-" * $colProvState), ("-" * $colSubject), ("-" * $colIssuingCA), ("-" * $colExpiry), ("-" * $colKVName), ("-" * $colKVSecret)) -ForegroundColor Cyan
+        Write-Host ("{0,-$colSub} {1,-$colFD} {2,-$colFDType} {3,-$colMigSource} {4,-$colMigTarget} {5,-$colDomain} {6,-$colEndpoint} {7,-$colCertType} {8,-$colProvState} {9,-$colSubject} {10,-$colIssuingCA} {11,-$colRootCA} {12,-$colExpiry} {13,-$colKVName} {14}" -f "Subscription", "FrontDoor", "FDType", "MigSource", "MigTarget", "Domain", "Endpoint", "CertType", "ProvState", "Subject", "IssuingCA", "RootCA", "ExpirationDate", "KVName", "KVSecret") -ForegroundColor Cyan
+        Write-Host ("{0,-$colSub} {1,-$colFD} {2,-$colFDType} {3,-$colMigSource} {4,-$colMigTarget} {5,-$colDomain} {6,-$colEndpoint} {7,-$colCertType} {8,-$colProvState} {9,-$colSubject} {10,-$colIssuingCA} {11,-$colRootCA} {12,-$colExpiry} {13,-$colKVName} {14}" -f ("-" * $colSub), ("-" * $colFD), ("-" * $colFDType), ("-" * $colMigSource), ("-" * $colMigTarget), ("-" * $colDomain), ("-" * $colEndpoint), ("-" * $colCertType), ("-" * $colProvState), ("-" * $colSubject), ("-" * $colIssuingCA), ("-" * $colRootCA), ("-" * $colExpiry), ("-" * $colKVName), ("-" * $colKVSecret)) -ForegroundColor Cyan
     }
     
     # Display results with color coding and truncation
@@ -2867,7 +3172,10 @@ if ($allResults.Count -eq 0) {
         $dispFD = Get-TruncatedString $result.FrontDoorName ($colFD - 1)
         $dispFDType = if ($result.FrontDoorType -eq 'Classic') { 'Cls' } else { 'StdPrm' }
         $dispFDType = Get-TruncatedString $dispFDType ($colFDType - 1)
+        $dispMigSource = Get-TruncatedString (Get-FrontDoorMigrationDisplayName -ResourceId $result.MigrationSourceResourceId) ($colMigSource - 1)
+        $dispMigTarget = Get-TruncatedString (Get-FrontDoorMigrationDisplayName -ResourceId $result.MigrationTargetResourceId) ($colMigTarget - 1)
         $dispDomain = Get-TruncatedString $result.Domain ($colDomain - 1)
+        $dispEndpoint = Get-TruncatedString $result.EndpointAssociation ($colEndpoint - 1)
         
         # Simplify certificate type display
         $certType = $result.CertificateType
@@ -2882,6 +3190,7 @@ if ($allResults.Count -eq 0) {
         
         $dispSubject = Get-TruncatedString $result.Subject ($colSubject - 1)
         $dispIssuingCA = Get-TruncatedString $result.IssuingCA ($colIssuingCA - 1)
+        $dispRootCA = Get-TruncatedString $result.RootCA ($colRootCA - 1)
         $dispKVName = Get-TruncatedString $result.KeyVaultName ($colKVName - 1)
         $dispKVSecret = Get-TruncatedString $result.KeyVaultSecretName ($colKVSecret - 1)
         
@@ -2901,8 +3210,8 @@ if ($allResults.Count -eq 0) {
             $dispExpiry = Get-TruncatedString $result.ExpirationDate ($colExpiry - 1)
         }
         
-        # Display subscription, frontdoor, fdtype, domain, and cert type
-        Write-Host ("{0,-$colSub} {1,-$colFD} {2,-$colFDType} {3,-$colDomain} {4,-$colCertType}" -f $dispSub, $dispFD, $dispFDType, $dispDomain, $dispCertType) -NoNewline
+        # Display subscription, frontdoor, migration hints, domain, and cert type
+        Write-Host ("{0,-$colSub} {1,-$colFD} {2,-$colFDType} {3,-$colMigSource} {4,-$colMigTarget} {5,-$colDomain} {6,-$colEndpoint} {7,-$colCertType}" -f $dispSub, $dispFD, $dispFDType, $dispMigSource, $dispMigTarget, $dispDomain, $dispEndpoint, $dispCertType) -NoNewline
         
         # Provisioning State with color
         if ($result.ProvisioningState -and $result.ProvisioningState -notlike '*Succeeded*' -and $result.ProvisioningState -notlike '*Enabled*') {
@@ -2926,6 +3235,7 @@ if ($allResults.Count -eq 0) {
         # Subject
         Write-Host (" {0,-$colSubject}" -f $dispSubject) -NoNewline
         Write-Host (" {0,-$colIssuingCA}" -f $dispIssuingCA) -NoNewline
+        Write-Host (" {0,-$colRootCA}" -f $dispRootCA) -NoNewline
         
         # Expiration Date with color
         if ($result.ExpirationStatus -eq 'EXPIRED') {

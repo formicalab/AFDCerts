@@ -6,7 +6,7 @@ Extract SSL/TLS certificate details from Azure Front Door deployments, including
 
 - PowerShell 7
 - Az.Accounts
-- Az.FrontDoor for Classic single-profile and subscription scans
+- Az.FrontDoor for Classic single-profile scans
 - An authenticated Azure session via `Connect-AzAccount`
 
 Tenant-wide discovery uses Azure Resource Graph and ARM through REST with the bearer token returned by Az.Accounts. It does not require the `Az.ResourceGraph` cmdlets.
@@ -17,6 +17,7 @@ Tenant-wide discovery uses Azure Resource Graph and ARM through REST with the be
 - Supports both Standard/Premium and Classic Front Door deployments
 - Skips default `*.azurefd.net` hostnames automatically so results focus on customer-facing domains
 - Reads ARM metadata for certificate configuration and enriches it with live TLS certificate data when available
+- Detects classic-to-Standard/Premium migration links and reports the related source or target resource IDs
 - Extracts issuer, issuing CA, chain status, intermediate CA, root CA, and a `DigiCertIssued` flag
 - Applies retry and backoff for transient REST and TLS failures
 - Exports to CSV or shows results in GridView
@@ -117,12 +118,16 @@ The console view shows a compact table with these operational columns:
 - `Subscription`
 - `FrontDoor`
 - `FDType`
+- `MigSource`
+- `MigTarget`
 - `Domain`
+- `Endpoint`
 - `CertType`
 - `ProvState`
 - `ValState` when Standard/Premium rows are present
 - `Subject`
 - `IssuingCA`
+- `RootCA`
 - `ExpirationDate`
 - `KVName`
 - `KVSecret`
@@ -133,6 +138,9 @@ CSV and GridView use the full stable export schema:
 - `SubscriptionName`
 - `FrontDoorName`
 - `FrontDoorType`
+- `MigrationSourceResourceId`
+- `MigrationTargetResourceId`
+- `EndpointAssociation`
 - `Domain`
 - `CertificateType`
 - `ProvisioningState`
@@ -151,6 +159,10 @@ CSV and GridView use the full stable export schema:
 - `KeyVaultSecretName`
 
 Classic rows leave `ValidationState` blank because Azure Front Door Classic does not expose a matching validation-state field.
+
+Standard/Premium rows populate `MigrationSourceResourceId` when they are the target of a Classic migration. Classic rows populate `MigrationTargetResourceId` when they have been migrated to Standard/Premium.
+
+For Standard/Premium rows, `EndpointAssociation` is derived from the endpoint routes that reference each custom domain. Domains that are not referenced by any endpoint route are reported as `Unassociated`.
 
 ## Proxy behavior
 
