@@ -7,6 +7,7 @@ Extract SSL/TLS certificate details from Azure Front Door deployments, including
 - PowerShell 7
 - Az.Accounts
 - Az.FrontDoor for Classic single-profile scans
+- Optional: ImportExcel for XLSX export
 - An authenticated Azure session via `Connect-AzAccount`
 
 Tenant-wide discovery uses Azure Resource Graph and ARM through REST with the bearer token returned by Az.Accounts. It does not require the `Az.ResourceGraph` cmdlets.
@@ -20,9 +21,9 @@ Tenant-wide discovery uses Azure Resource Graph and ARM through REST with the be
 - Detects classic-to-Standard/Premium migration links and reports the related source or target resource IDs
 - Extracts issuer, issuing CA, chain status, intermediate CA, root CA, and a `DigiCertIssued` flag
 - Applies retry and backoff for transient REST and TLS failures
-- Exports to CSV or shows results in GridView
+- Exports to CSV and, when ImportExcel is available, to XLSX with the same table styling used by Get-AFDOriginCertChains, or shows results in GridView
 
-`-GridView` and `-ExportCsvPath` are mutually exclusive.
+`-GridView` cannot be combined with `-ExportCsvPath` or `-ExportXlsxPath`. The two export paths can be used together.
 
 ## Scan modes
 
@@ -52,10 +53,16 @@ Tenant-wide discovery uses Azure Resource Graph and ARM through REST with the be
 
 ## Common examples
 
-### Export tenant results to CSV
+### Export tenant results to CSV and companion XLSX when available
 
 ```powershell
 .\get-frontdoor-certs.ps1 -ScanTenant -ExportCsvPath ".\reports\afd-certs.csv"
+```
+
+### Export tenant results directly to XLSX
+
+```powershell
+.\get-frontdoor-certs.ps1 -ScanTenant -ExportXlsxPath ".\reports\afd-certs.xlsx"
 ```
 
 ### Show a subscription scan in GridView
@@ -97,8 +104,9 @@ Tenant-wide discovery uses Azure Resource Graph and ARM through REST with the be
 | `ScanSubscription` | Yes* | - | Subscription name or ID to scan. Use `""` for the current subscription |
 | `ScanTenant` | Yes* | - | Scan all accessible subscriptions in the current tenant |
 | `FrontDoorType` | No | `All` | Filter subscription or tenant scans to `All`, `StandardPremium`, or `Classic` |
-| `ExportCsvPath` | No | - | Export results to CSV. Parent folders are created automatically |
-| `GridView` | No | `False` | Show results in GridView instead of exporting to CSV |
+| `ExportCsvPath` | No | - | Export results to CSV. When ImportExcel is installed and `ExportXlsxPath` is not specified, a companion XLSX with the same base name is also written. Parent folders are created automatically |
+| `ExportXlsxPath` | No | - | Export results to XLSX. Requires ImportExcel. When omitted, XLSX output falls back to the same base name as `ExportCsvPath` when CSV export is requested |
+| `GridView` | No | `False` | Show results in GridView instead of exporting results |
 | `WarningDays` | No | `30` | Mark certificates expiring within this many days as warnings |
 | `ThrottleLimit` | No | auto | Parallelism for ARM and Resource Graph work |
 | `TlsThrottleLimit` | No | auto | Parallelism for live TLS probing |
@@ -132,7 +140,7 @@ The console view shows a compact table with these operational columns:
 - `KVName`
 - `KVSecret`
 
-CSV and GridView use the full stable export schema:
+CSV, XLSX, and GridView use the full stable export schema:
 
 - `SubscriptionId`
 - `SubscriptionName`

@@ -1,2 +1,6 @@
 # Ignore the Tests folder
 Tests/
+
+# Ignore .csv and .xlsx files
+*.csv
+*.xlsx

@@ -6,7 +6,9 @@
     This script extracts certificate information from Azure Front Door deployments, supporting
     both Classic and Standard/Premium Front Door profiles. It displays certificate expiration
     dates with status indicators, shows provisioning and validation states, reports classic-to-
-    Standard/Premium migration links when present, and can export results to CSV for reporting.
+    Standard/Premium migration links when present, and can export results to CSV and, when
+    the ImportExcel module is installed, to XLSX for reporting. The XLSX output uses the same
+    Medium2 table styling used by Get-AFDOriginCertChains.
 
     The script supports both Azure-managed certificates and custom certificates from Key Vault,
     providing detailed information including certificate subject, issuing CA, provisioning state,
@@ -48,12 +50,20 @@
 .PARAMETER ExportCsvPath
     Optional path to export results as a CSV file. If specified, certificate details will be
     exported to this location for reporting and analysis purposes. The parent directory is
-    created automatically when it does not already exist. Cannot be combined with -GridView.
+    created automatically when it does not already exist. When ImportExcel is installed and
+    ExportXlsxPath is not specified, the script also writes a companion XLSX file with the same
+    base name. Cannot be combined with -GridView.
+
+.PARAMETER ExportXlsxPath
+    Optional path to export results as an XLSX workbook. Requires the ImportExcel module.
+    The parent directory is created automatically when it does not already exist. When omitted,
+    XLSX output defaults to the same base name as ExportCsvPath when CSV export is requested.
+    Cannot be combined with -GridView.
 
 .PARAMETER GridView
     Display results in an interactive GridView window. Allows sorting, filtering, and
     selecting results. Requires a graphical environment (not supported in headless sessions).
-    Cannot be combined with -ExportCsvPath.
+    Cannot be combined with -ExportCsvPath or -ExportXlsxPath.
 
 .PARAMETER WarningDays
     Number of days before certificate expiration to show warning indicators. Default is 30 days.
@@ -91,6 +101,8 @@
     custom objects containing certificate information, including issuer, issuing CA, and
     certificate-chain details. If ExportCsvPath is specified, results are also exported to a
     CSV file using a stable column set that includes migration source/target resource IDs.
+    If ExportXlsxPath is specified, or when ImportExcel is installed and XLSX output is derived
+    from ExportCsvPath, a workbook is written with the same data.
 
 .EXAMPLE
     .\get-frontdoor-certs.ps1 -ScanFrontDoor "my-frontdoor-profile" -ResourceGroupName "my-resource-group"
@@ -112,7 +124,13 @@
     .\get-frontdoor-certs.ps1 -ScanTenant -ExportCsvPath "C:\Reports\all-certs.csv"
     
     Scans all Front Door profiles across all accessible subscriptions in the tenant
-    and exports results to CSV.
+    and exports results to CSV, plus a same-base XLSX workbook when ImportExcel is installed.
+
+.EXAMPLE
+    .\get-frontdoor-certs.ps1 -ScanTenant -ExportXlsxPath "C:\Reports\all-certs.xlsx"
+
+    Scans all Front Door profiles across all accessible subscriptions in the tenant
+    and exports results directly to XLSX when ImportExcel is installed.
 
 .EXAMPLE
     .\get-frontdoor-certs.ps1 -ScanSubscription "Production" -GridView
@@ -159,6 +177,7 @@
     Module Requirements:
     - Az.Accounts module is required for all modes
     - Az.FrontDoor module is required for Classic single-profile scans
+    - ImportExcel module is optional for XLSX export
     
     Performance:
     - Tenant mode uses parallel processing for faster scanning
@@ -204,6 +223,9 @@ param(
 
     [Parameter(Mandatory = $false, HelpMessage = 'Path to export CSV results (optional)')]
     [string]$ExportCsvPath,
+
+    [Parameter(Mandatory = $false, HelpMessage = 'Path to export XLSX results (optional, requires ImportExcel)')]
+    [string]$ExportXlsxPath,
 
     [Parameter(Mandatory = $false, HelpMessage = 'Display results in an interactive GridView window')]
     [switch]$GridView,
@@ -624,8 +646,8 @@ if (-not $context) {
     throw "Not logged in to Azure. Please run Connect-AzAccount first."
 }
 
-if ($GridView -and $ExportCsvPath) {
-    throw "Use either -GridView or -ExportCsvPath, not both."
+if ($GridView -and ($ExportCsvPath -or $ExportXlsxPath)) {
+    throw "Use either -GridView or export paths (-ExportCsvPath / -ExportXlsxPath), not both."
 }
 
 # Global results collection (using List for better append performance)
@@ -1106,7 +1128,7 @@ function Get-FrontDoorMigrationDisplayName {
     return $ResourceId
 }
 
-# Creates the CSV parent directory when -ExportCsvPath points to a folder that does not exist yet.
+# Creates the parent directory for an export path when it does not exist yet.
 function Ensure-ParentDirectoryExists {
     param(
         [Parameter(Mandatory)]
@@ -1120,6 +1142,63 @@ function Ensure-ParentDirectoryExists {
     }
 
     return $resolvedFilePath
+}
+
+# Export-Excel writes the correct table style and freeze pane metadata when it saves directly,
+# but reopening and resaving through EPPlus in this environment strips that metadata.
+# Patch the table XML in place so the workbook keeps the same Medium2 table style used by
+# Get-AFDOriginCertChains, with row banding disabled.
+function Set-XlsxTableStyleInfo {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path,
+
+        [Parameter(Mandatory)]
+        [string]$TableStyleName
+    )
+
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+
+    $resolvedPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path)
+    $zip = [System.IO.Compression.ZipFile]::Open($resolvedPath, [System.IO.Compression.ZipArchiveMode]::Update)
+    try {
+        $tableEntries = @($zip.Entries | Where-Object { $_.FullName -like 'xl/tables/table*.xml' })
+        foreach ($tableEntry in $tableEntries) {
+            $reader = [System.IO.StreamReader]::new($tableEntry.Open())
+            try {
+                $tableXmlText = [System.String]::Copy($reader.ReadToEnd())
+            }
+            finally {
+                $reader.Dispose()
+            }
+
+            $updatedTableXmlText = $tableXmlText
+            $updatedTableXmlText = $updatedTableXmlText -replace '(<tableStyleInfo\b[^>]*\bname=")[^"]+(")', ('$1{0}$2' -f $TableStyleName)
+            $updatedTableXmlText = $updatedTableXmlText -replace '(showFirstColumn=")[^"]+(")', '${1}0$2'
+            $updatedTableXmlText = $updatedTableXmlText -replace '(showLastColumn=")[^"]+(")', '${1}0$2'
+            $updatedTableXmlText = $updatedTableXmlText -replace '(showRowStripes=")[^"]+(")', '${1}0$2'
+            $updatedTableXmlText = $updatedTableXmlText -replace '(showColumnStripes=")[^"]+(")', '${1}0$2'
+
+            if ($updatedTableXmlText -eq $tableXmlText) {
+                continue
+            }
+
+            $tableEntryPath = $tableEntry.FullName
+            $tableEntry.Delete()
+            $newTableEntry = $zip.CreateEntry($tableEntryPath)
+            $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+            $writer = [System.IO.StreamWriter]::new($newTableEntry.Open(), $utf8NoBom)
+            try {
+                $writer.Write($updatedTableXmlText)
+            }
+            finally {
+                $writer.Dispose()
+            }
+        }
+    }
+    finally {
+        $zip.Dispose()
+    }
 }
 
 #endregion
@@ -3270,12 +3349,88 @@ if ($allResults.Count -eq 0) {
         Write-Host "✅ All certificates are valid and not expiring soon" -ForegroundColor Green
     }
     
-    # Export to CSV if requested
-    if ($ExportCsvPath) {
-        $resolvedExportCsvPath = Ensure-ParentDirectoryExists -FilePath $ExportCsvPath
+    # Export to CSV and/or XLSX if requested
+    if ($ExportCsvPath -or $ExportXlsxPath) {
         $exportColumns = Get-ResultExportColumns
-        $allResults | Select-Object $exportColumns | Export-Csv -Path $resolvedExportCsvPath -NoTypeInformation -Force
-        Write-Host "`nResults exported to: $resolvedExportCsvPath" -ForegroundColor Green
+        $exportRecords = @($allResults | Select-Object $exportColumns)
+
+        $resolvedExportCsvPath = $null
+        if ($ExportCsvPath) {
+            $resolvedExportCsvPath = Ensure-ParentDirectoryExists -FilePath $ExportCsvPath
+            $exportRecords | Export-Csv -LiteralPath $resolvedExportCsvPath -NoTypeInformation -Encoding utf8 -Force
+            Write-Host "`nResults exported to: $resolvedExportCsvPath" -ForegroundColor Green
+        }
+
+        # An explicit XLSX path wins; otherwise keep the existing companion-workbook behavior
+        # by deriving the workbook path from the CSV export path.
+        $resolvedExportXlsxPath = $null
+        if ($ExportXlsxPath) {
+            $resolvedExportXlsxPath = Ensure-ParentDirectoryExists -FilePath $ExportXlsxPath
+        }
+        elseif ($resolvedExportCsvPath) {
+            $resolvedExportXlsxPath = [System.IO.Path]::ChangeExtension($resolvedExportCsvPath, '.xlsx')
+        }
+
+        $importExcelModule = Get-Module -ListAvailable -Name ImportExcel | Sort-Object Version -Descending | Select-Object -First 1
+        if ($resolvedExportXlsxPath -and $importExcelModule) {
+            try {
+                Import-Module $importExcelModule.Path -ErrorAction Stop | Out-Null
+
+                $xlsxTextColumns = @(
+                    'SubscriptionId',
+                    'SubscriptionName',
+                    'FrontDoorName',
+                    'FrontDoorType',
+                    'MigrationSourceResourceId',
+                    'MigrationTargetResourceId',
+                    'EndpointAssociation',
+                    'Domain',
+                    'CertificateType',
+                    'ProvisioningState',
+                    'ValidationState',
+                    'Subject',
+                    'Issuer',
+                    'IssuingCA',
+                    'IntermediateCA',
+                    'RootCA',
+                    'ChainStatus',
+                    'ExpirationStatus',
+                    'KeyVaultName',
+                    'KeyVaultSecretName'
+                )
+
+                $worksheetName = [System.IO.Path]::GetFileNameWithoutExtension($resolvedExportXlsxPath)
+                $worksheetName = $worksheetName -replace '[\\/\?\*\[\]:]', '_'
+                if ([string]::IsNullOrWhiteSpace($worksheetName)) {
+                    $worksheetName = 'afd-certs'
+                }
+                if ($worksheetName.Length -gt 31) {
+                    $worksheetName = $worksheetName.Substring(0, 31)
+                }
+
+                # ImportExcel attempts CurrentCulture numeric parsing on string values by default.
+                # Keep text-heavy columns as literal text so hostnames and IDs are never coerced.
+                $exportRecords | Export-Excel -Path $resolvedExportXlsxPath -WorksheetName $worksheetName -TableName Table1 -TableStyle Medium2 -NoNumberConversion $xlsxTextColumns -AutoFilter -AutoSize -FreezeTopRow -ClearSheet | Out-Null
+                Set-XlsxTableStyleInfo -Path $resolvedExportXlsxPath -TableStyleName 'TableStyleMedium2'
+                if ($resolvedExportCsvPath) {
+                    Write-Host "Companion XLSX exported to: $resolvedExportXlsxPath" -ForegroundColor Green
+                }
+                else {
+                    Write-Host "Results exported to XLSX: $resolvedExportXlsxPath" -ForegroundColor Green
+                }
+            }
+            catch {
+                Write-Host "ImportExcel is installed but XLSX export failed: $($_.Exception.Message)" -ForegroundColor DarkYellow
+            }
+        }
+        elseif ($resolvedExportXlsxPath) {
+            if ($resolvedExportCsvPath) {
+                Write-Host 'ImportExcel module not found. Skipping XLSX export and keeping CSV only.' -ForegroundColor DarkYellow
+            }
+            else {
+                Write-Host 'ImportExcel module not found. Skipping requested XLSX export.' -ForegroundColor DarkYellow
+            }
+        }
     }
     
     # Display in GridView if requested
