@@ -162,15 +162,20 @@ CSV, XLSX, and GridView use the full stable export schema:
 - `ChainStatus`
 - `DigiCertIssued`
 - `ExpirationDate`
-- `ExpirationStatus`
 - `KeyVaultName`
 - `KeyVaultSecretName`
+
+`ChainStatus` now represents the overall certificate situation for export and GridView purposes. It combines live probe errors, chain validation results, and expiration warnings into one field such as `OK`, `Chain: PartialChain`, `Expiration: WARNING`, or `CheckError: No such host is known`.
+
+When XLSX export is available, `ExpirationDate` is written as a real Excel date/time value and formatted with the current culture's long date/time pattern so Excel can render the local date, hour, minute, and second presentation correctly.
 
 Classic rows leave `ValidationState` blank because Azure Front Door Classic does not expose a matching validation-state field.
 
 Standard/Premium rows populate `MigrationSourceResourceId` when they are the target of a Classic migration. Classic rows populate `MigrationTargetResourceId` when they have been migrated to Standard/Premium.
 
-For Standard/Premium rows, `EndpointAssociation` is derived from the endpoint routes that reference each custom domain. Domains that are not referenced by any endpoint route are reported as `Unassociated`.
+For Standard/Premium rows, `EndpointAssociation` is derived from the endpoint host names whose routes reference each custom domain. The script keeps partial association results even if one endpoint's route lookup fails. Domains that are not referenced by any endpoint route are reported as `Unassociated`.
+
+If the requested XLSX output path is already open in Excel, the script writes the workbook to a timestamped sibling file instead of failing the export.
 
 ## Proxy behavior
 

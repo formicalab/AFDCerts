@@ -508,6 +508,43 @@ function Get-HttpStatusCodeFromException {
     return $null
 }
 
+# Flattens nested exception messages into one line for logs and exported status fields.
+function Get-ExceptionMessageSummary {
+    param(
+        [Parameter(Mandatory = $false)]
+        [AllowNull()]
+        [System.Exception]$Exception,
+
+        [Parameter(Mandatory = $false)]
+        [string]$PrefixMessage
+    )
+
+    $messageParts = [System.Collections.Generic.List[string]]::new()
+    if (-not [string]::IsNullOrWhiteSpace($PrefixMessage)) {
+        $messageParts.Add($PrefixMessage)
+    }
+
+    $currentException = $Exception
+    while ($currentException) {
+        $message = [string]$currentException.Message
+        if (-not [string]::IsNullOrWhiteSpace($message) -and -not $messageParts.Contains($message)) {
+            $messageParts.Add($message)
+        }
+
+        if (-not $currentException.InnerException -or $currentException.InnerException -eq $currentException) {
+            break
+        }
+
+        $currentException = $currentException.InnerException
+    }
+
+    if ($messageParts.Count -eq 0) {
+        return $null
+    }
+
+    return ($messageParts -join ' ')
+}
+
 # Identifies Azure REST failures that are worth retrying with backoff.
 function Test-IsTransientRestFailure {
     param(
@@ -525,21 +562,7 @@ function Test-IsTransientRestFailure {
         return $statusCode -in 408, 409, 429, 500, 502, 503, 504
     }
 
-    $messageParts = [System.Collections.Generic.List[string]]::new()
-    $currentException = $Exception
-    while ($currentException) {
-        if (-not [string]::IsNullOrWhiteSpace($currentException.Message)) {
-            $messageParts.Add($currentException.Message)
-        }
-
-        if (-not $currentException.InnerException -or $currentException.InnerException -eq $currentException) {
-            break
-        }
-
-        $currentException = $currentException.InnerException
-    }
-
-    $message = ($messageParts -join ' ')
+    $message = Get-ExceptionMessageSummary -Exception $Exception
     return $message -match 'timed out|timeout|temporar|throttl|too many requests|connection.+(reset|aborted|closed)|remote party closed|EOF|unexpected end'
 }
 
@@ -554,25 +577,7 @@ function Test-IsTransientTlsFailure {
         [string]$FailureMessage
     )
 
-    $messageParts = [System.Collections.Generic.List[string]]::new()
-    if (-not [string]::IsNullOrWhiteSpace($FailureMessage)) {
-        $messageParts.Add($FailureMessage)
-    }
-
-    $currentException = $Exception
-    while ($currentException) {
-        if (-not [string]::IsNullOrWhiteSpace($currentException.Message)) {
-            $messageParts.Add($currentException.Message)
-        }
-
-        if (-not $currentException.InnerException -or $currentException.InnerException -eq $currentException) {
-            break
-        }
-
-        $currentException = $currentException.InnerException
-    }
-
-    $message = ($messageParts -join ' ')
+    $message = Get-ExceptionMessageSummary -Exception $Exception -PrefixMessage $FailureMessage
     if ([string]::IsNullOrWhiteSpace($message)) {
         return $false
     }
@@ -839,6 +844,53 @@ function Get-ChainStatusSummary {
     return ($statuses -join ',')
 }
 
+# Collapses probe errors, chain state, and expiration state into one export-friendly status field.
+function Get-CertificateStatusSummary {
+    param(
+        [Parameter(Mandatory = $false)]
+        [string]$ChainStatus,
+
+        [Parameter(Mandatory = $false)]
+        [string]$ExpirationStatus,
+
+        [Parameter(Mandatory = $false)]
+        [string[]]$Errors,
+
+        [Parameter(Mandatory = $false)]
+        [bool]$HasExpirationDate
+    )
+
+    $parts = [System.Collections.Generic.List[string]]::new()
+    $uniqueErrors = @(
+        $Errors |
+            Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } |
+            Select-Object -Unique
+    )
+
+    foreach ($error in $uniqueErrors) {
+        $parts.Add("CheckError: $error")
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($ChainStatus) -and $ChainStatus -ne 'Valid') {
+        $parts.Add("Chain: $ChainStatus")
+    }
+
+    switch ($ExpirationStatus) {
+        'EXPIRED' { $parts.Add('Expiration: EXPIRED') }
+        'WARNING' { $parts.Add('Expiration: WARNING') }
+    }
+
+    if ($parts.Count -gt 0) {
+        return ($parts -join ' | ')
+    }
+
+    if ($ChainStatus -eq 'Valid' -or ($HasExpirationDate -and $ExpirationStatus -eq 'OK')) {
+        return 'OK'
+    }
+
+    return 'NoData'
+}
+
 # Builds chain metadata for reporting from a live certificate or REST-provided issuer data.
 function Get-CertificateChainDetails {
     param(
@@ -945,7 +997,7 @@ function Test-IsDefaultAzureFrontDoorHostname {
     return $HostName.EndsWith('.azurefd.net', [System.StringComparison]::OrdinalIgnoreCase)
 }
 
-# Maps each Standard/Premium custom-domain resource ID to the endpoint names whose routes reference it.
+# Maps each Standard/Premium custom-domain resource ID to the endpoint host names whose routes reference it.
 function Get-AfdCustomDomainEndpointAssociations {
     param(
         [Parameter(Mandatory)]
@@ -980,11 +1032,23 @@ function Get-AfdCustomDomainEndpointAssociations {
             continue
         }
 
+        $endpointAssociation = [string]($afdEndpoint.properties.hostName ?? $endpointName)
+        if ([string]::IsNullOrWhiteSpace($endpointAssociation)) {
+            $endpointAssociation = $endpointName
+        }
+
         $pathRoutes = "/subscriptions/$SubscriptionId/resourceGroups/$ResourceGroupName/providers/Microsoft.Cdn/profiles/$ProfileName/afdEndpoints/$endpointName/routes?api-version=$ApiVersion"
-        $routesResp = Invoke-WithRetry -Action {
-            Invoke-AzRest -Path $pathRoutes -Method GET -ErrorAction Stop
-        } -OperationName "route lookup for $ProfileName/$endpointName" -Category Rest -MaxAttempts $RestRetryCount -BaseDelayMs $RetryBaseDelayMs
-        $routes = @(($routesResp.Content | ConvertFrom-Json).value)
+        try {
+            $routesResp = Invoke-WithRetry -Action {
+                Invoke-AzRest -Path $pathRoutes -Method GET -ErrorAction Stop
+            } -OperationName "route lookup for $ProfileName/$endpointName" -Category Rest -MaxAttempts $RestRetryCount -BaseDelayMs $RetryBaseDelayMs
+            $routes = @(($routesResp.Content | ConvertFrom-Json).value)
+        }
+        catch {
+            $routeLookupError = Get-ExceptionMessageSummary -Exception $_.Exception
+            Write-Host "    Failed to resolve routes for endpoint ${endpointAssociation}: $routeLookupError" -ForegroundColor Yellow
+            continue
+        }
 
         foreach ($route in $routes) {
             foreach ($customDomainRef in @($route.properties.customDomains)) {
@@ -998,7 +1062,7 @@ function Get-AfdCustomDomainEndpointAssociations {
                     $associationSets[$domainKey] = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
                 }
 
-                $null = $associationSets[$domainKey].Add($endpointName)
+                $null = $associationSets[$domainKey].Add($endpointAssociation)
             }
         }
     }
@@ -1011,8 +1075,8 @@ function Get-AfdCustomDomainEndpointAssociations {
     return $associationMap
 }
 
-# Returns a stable column projection for CSV export and GridView, even when mixed result objects
-# do not all expose the same properties.
+# Returns a stable column projection for CSV, XLSX, and GridView, even when mixed result
+# objects do not all expose the same properties.
 function Get-ResultExportColumns {
     return @(
         'SubscriptionId',
@@ -1035,10 +1099,46 @@ function Get-ResultExportColumns {
         'ChainStatus',
         'DigiCertIssued',
         'ExpirationDate',
-        'ExpirationStatus',
         'KeyVaultName',
         'KeyVaultSecretName'
     )
+}
+
+# Projects records for XLSX export while preserving a typed ExpirationDate cell.
+function Get-XlsxExportRecords {
+    param(
+        [Parameter(Mandatory)]
+        [object[]]$Results,
+
+        [Parameter(Mandatory)]
+        [string[]]$Columns
+    )
+
+    $xlsxRecords = foreach ($result in $Results) {
+        $record = [ordered]@{}
+        foreach ($column in $Columns) {
+            $record[$column] = $result.$column
+        }
+
+        $rawExpirationDate = $null
+        $rawExpirationDateProperty = $result.PSObject.Properties['ExpirationDateRaw']
+        if ($null -ne $rawExpirationDateProperty) {
+            $rawExpirationDate = $rawExpirationDateProperty.Value
+        }
+
+        if ($rawExpirationDate) {
+            try {
+                $record['ExpirationDate'] = $rawExpirationDate -is [DateTime] ? $rawExpirationDate : [DateTime]::Parse($rawExpirationDate.ToString())
+            }
+            catch {
+                $record['ExpirationDate'] = $result.ExpirationDate
+            }
+        }
+
+        [PSCustomObject]$record
+    }
+
+    return @($xlsxRecords)
 }
 
 # Extracts classic-to-Standard/Premium migration links from ARM resource metadata.
@@ -1129,7 +1229,7 @@ function Get-FrontDoorMigrationDisplayName {
 }
 
 # Creates the parent directory for an export path when it does not exist yet.
-function Ensure-ParentDirectoryExists {
+function Initialize-ParentDirectoryPath {
     param(
         [Parameter(Mandatory)]
         [string]$FilePath
@@ -1142,6 +1242,61 @@ function Ensure-ParentDirectoryExists {
     }
 
     return $resolvedFilePath
+}
+
+# Redirects exports to a timestamped sibling path when the requested file is locked.
+function Resolve-AvailableExportFilePath {
+    param(
+        [Parameter(Mandatory)]
+        [string]$FilePath
+    )
+
+    $resolvedFilePath = Initialize-ParentDirectoryPath -FilePath $FilePath
+    $parentDirectory = Split-Path -Parent $resolvedFilePath
+    $fileName = [System.IO.Path]::GetFileName($resolvedFilePath)
+    $fileExtension = [System.IO.Path]::GetExtension($resolvedFilePath)
+    $fileNameBase = [System.IO.Path]::GetFileNameWithoutExtension($resolvedFilePath)
+    $lockFilePath = $null
+
+    if ($fileExtension -eq '.xlsx') {
+        $lockFilePath = Join-Path $parentDirectory ("~$" + $fileName)
+    }
+
+    $canWriteRequestedPath = $true
+    if (Test-Path -LiteralPath $resolvedFilePath) {
+        $stream = $null
+        try {
+            $stream = [System.IO.File]::Open($resolvedFilePath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+        }
+        catch {
+            $canWriteRequestedPath = $false
+        }
+        finally {
+            if ($stream) {
+                $stream.Dispose()
+            }
+        }
+    }
+
+    if (($lockFilePath -and (Test-Path -LiteralPath $lockFilePath)) -or -not $canWriteRequestedPath) {
+        $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss-fff'
+        $candidatePath = Join-Path $parentDirectory ("{0}-{1}{2}" -f $fileNameBase, $timestamp, $fileExtension)
+        $attempt = 1
+        while (Test-Path -LiteralPath $candidatePath) {
+            $candidatePath = Join-Path $parentDirectory ("{0}-{1}-{2}{3}" -f $fileNameBase, $timestamp, $attempt, $fileExtension)
+            $attempt++
+        }
+
+        return @{
+            Path = $candidatePath
+            Redirected = $true
+        }
+    }
+
+    return @{
+        Path = $resolvedFilePath
+        Redirected = $false
+    }
 }
 
 # Export-Excel writes the correct table style and freeze pane metadata when it saves directly,
@@ -1325,7 +1480,7 @@ function Get-FormattedExpirationDate {
     )
     
     if (-not $expiryDate) {
-        return @{ Display = $null; Status = 'OK' }
+        return @{ Display = $null; Status = 'OK'; Value = $null }
     }
     
     try {
@@ -1337,10 +1492,10 @@ function Get-FormattedExpirationDate {
         
         $status = $daysUntilExpiry -lt 0 ? 'EXPIRED' : ($daysUntilExpiry -le $warningDays ? 'WARNING' : 'OK')
         
-        return @{ Display = $formattedDate; Status = $status }
+        return @{ Display = $formattedDate; Status = $status; Value = $expiryDateTime }
     } catch {
         # If date parsing fails, use the original value
-        return @{ Display = $expiryDate; Status = 'OK' }
+        return @{ Display = $expiryDate; Status = 'OK'; Value = $null }
     }
 }
 
@@ -1640,6 +1795,7 @@ function Get-FrontDoorCertificates {
                 $rootCA = $null
                 $chainStatus = $null
                 $digiCertIssued = $null
+                $statusErrors = [System.Collections.Generic.List[string]]::new()
                 $keyVaultName = $null
                 $keyVaultSecretName = $null
                 # Classic rows keep ValidationState blank so mixed exports use one schema.
@@ -1670,10 +1826,8 @@ function Get-FrontDoorCertificates {
                     
                     Write-Host " OK" -ForegroundColor Green
                 } catch {
-                    # Extract a cleaner error message from exception chain
-                    $innerEx = $_.Exception.InnerException
-                    while ($innerEx -and $innerEx.InnerException) { $innerEx = $innerEx.InnerException }
-                    $errorMsg = if ($innerEx) { $innerEx.Message } else { $_.Exception.Message }
+                    $errorMsg = Get-ExceptionMessageSummary -Exception $_.Exception
+                    $null = $statusErrors.Add($errorMsg)
                     Write-Host " Failed: $errorMsg" -ForegroundColor Yellow
                 }
                 
@@ -1681,6 +1835,8 @@ function Get-FrontDoorCertificates {
                 $expiryInfo = Get-FormattedExpirationDate -expiryDate $expiryDate -warningDays $WarningDays
                 $expiryDisplay = $expiryInfo.Display
                 $expiryStatus = $expiryInfo.Status
+                $expiryRaw = $expiryInfo.Value
+                $overallStatus = Get-CertificateStatusSummary -ChainStatus $chainStatus -ExpirationStatus $expiryStatus -Errors @($statusErrors) -HasExpirationDate ($null -ne $expiryRaw)
                 
                 $result = [PSCustomObject]@{
                     SubscriptionId     = $context.Subscription.Id
@@ -1700,8 +1856,9 @@ function Get-FrontDoorCertificates {
                     ServerCertificateCount = $serverCertificateCount
                     IntermediateCA         = $intermediateCA
                     RootCA                 = $rootCA
-                    ChainStatus            = $chainStatus
+                    ChainStatus            = $overallStatus
                     DigiCertIssued         = $digiCertIssued
+                    ExpirationDateRaw  = $expiryRaw
                     ExpirationDate     = $expiryDisplay
                     ExpirationStatus   = $expiryStatus
                     KeyVaultName       = $keyVaultName
@@ -1770,7 +1927,8 @@ function Get-FrontDoorCertificates {
                     -RetryBaseDelayMs $RetryBaseDelayMs
             }
             catch {
-                Write-Host "  Failed to resolve endpoint associations for ${fdName}: $($_.Exception.Message)" -ForegroundColor Yellow
+                $associationError = Get-ExceptionMessageSummary -Exception $_.Exception
+                Write-Host "  Failed to resolve endpoint associations for ${fdName}: $associationError" -ForegroundColor Yellow
             }
 
             foreach ($d in $eligibleDomains) {
@@ -1789,6 +1947,7 @@ function Get-FrontDoorCertificates {
                 $rootCA = $null
                 $chainStatus = $null
                 $digiCertIssued = $null
+                $statusErrors = [System.Collections.Generic.List[string]]::new()
                 
                 $domainName = $d.properties.hostName ?? $d.name
                 $domainAssociation = 'Unassociated'
@@ -1855,7 +2014,9 @@ function Get-FrontDoorCertificates {
                             Write-Host " OK" -ForegroundColor Green
                         }
                         catch {
-                            Write-Host " Failed" -ForegroundColor Yellow
+                            $errorMsg = Get-ExceptionMessageSummary -Exception $_.Exception
+                            $null = $statusErrors.Add("SecretLookup: $errorMsg")
+                            Write-Host " Failed: $errorMsg" -ForegroundColor Yellow
                         }
                     }
                 }
@@ -1877,6 +2038,8 @@ function Get-FrontDoorCertificates {
                         }
                     }
                     catch {
+                        $errorMsg = Get-ExceptionMessageSummary -Exception $_.Exception
+                        $null = $statusErrors.Add("TLS: $errorMsg")
                     }
                 }
 
@@ -1884,6 +2047,8 @@ function Get-FrontDoorCertificates {
                 $expiryInfo = Get-FormattedExpirationDate -expiryDate $expiryDate -warningDays $WarningDays
                 $expiryDisplay = $expiryInfo.Display
                 $expiryStatus = $expiryInfo.Status
+                $expiryRaw = $expiryInfo.Value
+                $overallStatus = Get-CertificateStatusSummary -ChainStatus $chainStatus -ExpirationStatus $expiryStatus -Errors @($statusErrors) -HasExpirationDate ($null -ne $expiryRaw)
 
                 $result = [PSCustomObject]@{
                     SubscriptionId     = $context.Subscription.Id
@@ -1903,8 +2068,9 @@ function Get-FrontDoorCertificates {
                     ServerCertificateCount = $serverCertificateCount
                     IntermediateCA         = $intermediateCA
                     RootCA                 = $rootCA
-                    ChainStatus            = $chainStatus
+                    ChainStatus            = $overallStatus
                     DigiCertIssued         = $digiCertIssued
+                    ExpirationDateRaw  = $expiryRaw
                     ExpirationDate     = $expiryDisplay
                     ExpirationStatus   = $expiryStatus
                     KeyVaultName       = $keyVaultName
@@ -2185,6 +2351,35 @@ elseif ($PSCmdlet.ParameterSetName -eq 'ScanTenant') {
                     return $null
                 }
 
+                function Get-ExceptionMessageSummaryLocal {
+                    param([AllowNull()][System.Exception]$Exception, [string]$PrefixMessage)
+
+                    $messageParts = [System.Collections.Generic.List[string]]::new()
+                    if (-not [string]::IsNullOrWhiteSpace($PrefixMessage)) {
+                        $messageParts.Add($PrefixMessage)
+                    }
+
+                    $currentException = $Exception
+                    while ($currentException) {
+                        $message = [string]$currentException.Message
+                        if (-not [string]::IsNullOrWhiteSpace($message) -and -not $messageParts.Contains($message)) {
+                            $messageParts.Add($message)
+                        }
+
+                        if (-not $currentException.InnerException -or $currentException.InnerException -eq $currentException) {
+                            break
+                        }
+
+                        $currentException = $currentException.InnerException
+                    }
+
+                    if ($messageParts.Count -eq 0) {
+                        return $null
+                    }
+
+                    return ($messageParts -join ' ')
+                }
+
                 # Identifies retryable REST failures for ARM and Resource Manager calls.
                 function Test-IsTransientRestFailureLocal {
                     param([AllowNull()][System.Exception]$Exception)
@@ -2198,10 +2393,7 @@ elseif ($PSCmdlet.ParameterSetName -eq 'ScanTenant') {
                         return $statusCode -in 408, 409, 429, 500, 502, 503, 504
                     }
 
-                    $message = $Exception.Message
-                    if ($Exception.InnerException -and $Exception.InnerException.Message) {
-                        $message = "{0} {1}" -f $message, $Exception.InnerException.Message
-                    }
+                    $message = Get-ExceptionMessageSummaryLocal -Exception $Exception
 
                     return $message -match 'timed out|timeout|temporar|throttl|too many requests|connection.+(reset|aborted|closed)|remote party closed|EOF|unexpected end'
                 }
@@ -2210,13 +2402,7 @@ elseif ($PSCmdlet.ParameterSetName -eq 'ScanTenant') {
                 function Test-IsTransientTlsFailureLocal {
                     param([AllowNull()][System.Exception]$Exception, [string]$FailureMessage)
 
-                    $message = $FailureMessage
-                    if ($Exception -and $Exception.Message) {
-                        $message = if ($message) { "{0} {1}" -f $message, $Exception.Message } else { $Exception.Message }
-                    }
-                    if ($Exception -and $Exception.InnerException -and $Exception.InnerException.Message) {
-                        $message = if ($message) { "{0} {1}" -f $message, $Exception.InnerException.Message } else { $Exception.InnerException.Message }
-                    }
+                    $message = Get-ExceptionMessageSummaryLocal -Exception $Exception -PrefixMessage $FailureMessage
 
                     return $message -match 'timed out|timeout|temporar|connection.+(reset|aborted|closed)|remote party closed|EOF|unexpected end|network.+unreachable|host.+unreachable|Proxy CONNECT failed: HTTP/\d\.\d (429|502|503|504)'
                 }
@@ -2321,16 +2507,42 @@ elseif ($PSCmdlet.ParameterSetName -eq 'ScanTenant') {
                     return ($statuses -join ',')
                 }
 
-                # Builds certificate-chain metadata from the live certificate presented by the endpoint.
-                function Get-CertificateChainDetailsLocal {
-                    param(
-                        [System.Security.Cryptography.X509Certificates.X509Certificate2]$Certificate,
-                        [string]$IssuerString,
-                        [string]$IssuingCAName
+                # Mirrors the exported ChainStatus format used by the non-parallel scan paths.
+                function Get-CertificateStatusSummaryLocal {
+                    param([string]$ChainStatus, [string]$ExpirationStatus, [string[]]$Errors, [bool]$HasExpirationDate)
+
+                    $parts = [System.Collections.Generic.List[string]]::new()
+                    $uniqueErrors = @(
+                        $Errors |
+                            Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } |
+                            Select-Object -Unique
                     )
 
-                    if (-not $Certificate) {
+                    foreach ($error in $uniqueErrors) {
+                        $parts.Add("CheckError: $error")
+                    }
 
+                    if (-not [string]::IsNullOrWhiteSpace($ChainStatus) -and $ChainStatus -ne 'Valid') {
+                        $parts.Add("Chain: $ChainStatus")
+                    }
+
+                    switch ($ExpirationStatus) {
+                        'EXPIRED' { $parts.Add('Expiration: EXPIRED') }
+                        'WARNING' { $parts.Add('Expiration: WARNING') }
+                    }
+
+                    if ($parts.Count -gt 0) {
+                        return ($parts -join ' | ')
+                    }
+
+                    if ($ChainStatus -eq 'Valid' -or ($HasExpirationDate -and $ExpirationStatus -eq 'OK')) {
+                        return 'OK'
+                    }
+
+                    return 'NoData'
+                }
+
+                # Maps each custom-domain resource ID to the endpoint host names whose routes reference it.
                 function Get-DomainEndpointAssociationsLocal {
                     param(
                         [Parameter(Mandatory)]
@@ -2361,10 +2573,20 @@ elseif ($PSCmdlet.ParameterSetName -eq 'ScanTenant') {
                             continue
                         }
 
+                        $endpointAssociation = [string]($afdEndpoint.properties.hostName ?? $endpointName)
+                        if ([string]::IsNullOrWhiteSpace($endpointAssociation)) {
+                            $endpointAssociation = $endpointName
+                        }
+
                         $routesUri = "$ProfileBaseUri/afdEndpoints/$endpointName/routes?api-version=$ApiVersion"
-                        $routesResp = Invoke-WithRetryLocal -Action {
-                            Invoke-RestMethod -Method Get -Uri $routesUri -Headers $Headers -ErrorAction Stop
-                        } -Category Rest -MaxAttempts $MaxAttempts -BaseDelayMs $BaseDelayMs
+                        try {
+                            $routesResp = Invoke-WithRetryLocal -Action {
+                                Invoke-RestMethod -Method Get -Uri $routesUri -Headers $Headers -ErrorAction Stop
+                            } -Category Rest -MaxAttempts $MaxAttempts -BaseDelayMs $BaseDelayMs
+                        }
+                        catch {
+                            continue
+                        }
 
                         foreach ($route in @($routesResp.value)) {
                             foreach ($customDomainRef in @($route.properties.customDomains)) {
@@ -2378,7 +2600,7 @@ elseif ($PSCmdlet.ParameterSetName -eq 'ScanTenant') {
                                     $associationSets[$domainKey] = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
                                 }
 
-                                $null = $associationSets[$domainKey].Add($endpointName)
+                                $null = $associationSets[$domainKey].Add($endpointAssociation)
                             }
                         }
                     }
@@ -2390,6 +2612,16 @@ elseif ($PSCmdlet.ParameterSetName -eq 'ScanTenant') {
 
                     return $associationMap
                 }
+
+                # Builds certificate-chain metadata from the live certificate presented by the endpoint.
+                function Get-CertificateChainDetailsLocal {
+                    param(
+                        [System.Security.Cryptography.X509Certificates.X509Certificate2]$Certificate,
+                        [string]$IssuerString,
+                        [string]$IssuingCAName
+                    )
+
+                    if (-not $Certificate) {
                         return @{
                             Subject                = $null
                             Issuer                 = $IssuerString
@@ -2482,6 +2714,8 @@ elseif ($PSCmdlet.ParameterSetName -eq 'ScanTenant') {
                         $domainEndpointAssociations = Get-DomainEndpointAssociationsLocal -ProfileBaseUri $baseUri -ApiVersion $apiVer -Headers $hdrs -MaxAttempts $restRetryCount -BaseDelayMs $retryBaseDelayMs
                     }
                     catch {
+                        $associationError = Get-ExceptionMessageSummaryLocal -Exception $_.Exception
+                        Write-Host "    Failed to resolve endpoint associations for $($fd.Name): $associationError" -ForegroundColor Yellow
                         $domainEndpointAssociations = @{}
                     }
                     $includedDomainCount = 0
@@ -2505,6 +2739,7 @@ elseif ($PSCmdlet.ParameterSetName -eq 'ScanTenant') {
                         $rootCA = $null
                         $chainStatus = $null
                         $digiCertIssued = $null
+                        $statusErrors = [System.Collections.Generic.List[string]]::new()
                         $keyVaultName = $null
                         $keyVaultSecretName = $null
                         $domainAssociation = 'Unassociated'
@@ -2548,7 +2783,10 @@ elseif ($PSCmdlet.ParameterSetName -eq 'ScanTenant') {
                                         $issuer = $issuerDetails.Issuer
                                         $issuingCA = $issuerDetails.IssuingCA
                                     }
-                                } catch { }
+                                } catch {
+                                    $errorMsg = Get-ExceptionMessageSummaryLocal -Exception $_.Exception
+                                    $null = $statusErrors.Add("SecretLookup: $errorMsg")
+                                }
                             }
                         }
 
@@ -2571,12 +2809,15 @@ elseif ($PSCmdlet.ParameterSetName -eq 'ScanTenant') {
                                 }
                             }
                             catch {
+                                $errorMsg = Get-ExceptionMessageSummaryLocal -Exception $_.Exception
+                                $null = $statusErrors.Add("TLS: $errorMsg")
                             }
                         }
                         
                         # Calculate expiration status
                         $expiryDisplay = $null
                         $expiryStatus = 'OK'
+                        $expiryDateTime = $null
                         if ($expiryDate) {
                             try {
                                 $expiryDateTime = if ($expiryDate -is [DateTime]) { $expiryDate } else { [DateTime]::Parse($expiryDate) }
@@ -2585,6 +2826,7 @@ elseif ($PSCmdlet.ParameterSetName -eq 'ScanTenant') {
                                 $expiryStatus = if ($daysUntilExpiry -lt 0) { 'EXPIRED' } elseif ($daysUntilExpiry -le $warnDays) { 'WARNING' } else { 'OK' }
                             } catch { $expiryDisplay = $expiryDate }
                         }
+                        $overallStatus = Get-CertificateStatusSummaryLocal -ChainStatus $chainStatus -ExpirationStatus $expiryStatus -Errors @($statusErrors) -HasExpirationDate ($null -ne $expiryDateTime)
                         
                         [PSCustomObject]@{
                             SubscriptionId     = $fd.SubscriptionId
@@ -2604,8 +2846,9 @@ elseif ($PSCmdlet.ParameterSetName -eq 'ScanTenant') {
                             ServerCertificateCount = $serverCertificateCount
                             IntermediateCA         = $intermediateCA
                             RootCA                 = $rootCA
-                            ChainStatus            = $chainStatus
+                            ChainStatus            = $overallStatus
                             DigiCertIssued         = $digiCertIssued
+                            ExpirationDateRaw  = $expiryDateTime
                             ExpirationDate     = $expiryDisplay
                             ExpirationStatus   = $expiryStatus
                             KeyVaultName       = $keyVaultName
@@ -2616,7 +2859,7 @@ elseif ($PSCmdlet.ParameterSetName -eq 'ScanTenant') {
                     # Progress marker
                     [PSCustomObject]@{ __Progress = $true; FrontDoorName = $fd.Name; DomainCount = $includedDomainCount }
                 } catch {
-                    [PSCustomObject]@{ __Progress = $true; FrontDoorName = $fd.Name; DomainCount = 0; Error = $_.Exception.Message }
+                    [PSCustomObject]@{ __Progress = $true; FrontDoorName = $fd.Name; DomainCount = 0; Error = (Get-ExceptionMessageSummaryLocal -Exception $_.Exception) }
                 }
             } | ForEach-Object {
                 if ($_.PSObject.Properties['__Progress']) {
@@ -2683,6 +2926,35 @@ elseif ($PSCmdlet.ParameterSetName -eq 'ScanTenant') {
                     return $null
                 }
 
+                function Get-ExceptionMessageSummaryLocal {
+                    param([AllowNull()][System.Exception]$Exception, [string]$PrefixMessage)
+
+                    $messageParts = [System.Collections.Generic.List[string]]::new()
+                    if (-not [string]::IsNullOrWhiteSpace($PrefixMessage)) {
+                        $messageParts.Add($PrefixMessage)
+                    }
+
+                    $currentException = $Exception
+                    while ($currentException) {
+                        $message = [string]$currentException.Message
+                        if (-not [string]::IsNullOrWhiteSpace($message) -and -not $messageParts.Contains($message)) {
+                            $messageParts.Add($message)
+                        }
+
+                        if (-not $currentException.InnerException -or $currentException.InnerException -eq $currentException) {
+                            break
+                        }
+
+                        $currentException = $currentException.InnerException
+                    }
+
+                    if ($messageParts.Count -eq 0) {
+                        return $null
+                    }
+
+                    return ($messageParts -join ' ')
+                }
+
                 # Identifies retryable REST failures during Classic endpoint discovery.
                 function Test-IsTransientRestFailureLocal {
                     param([AllowNull()][System.Exception]$Exception)
@@ -2696,10 +2968,7 @@ elseif ($PSCmdlet.ParameterSetName -eq 'ScanTenant') {
                         return $statusCode -in 408, 409, 429, 500, 502, 503, 504
                     }
 
-                    $message = $Exception.Message
-                    if ($Exception.InnerException -and $Exception.InnerException.Message) {
-                        $message = "{0} {1}" -f $message, $Exception.InnerException.Message
-                    }
+                    $message = Get-ExceptionMessageSummaryLocal -Exception $Exception
 
                     return $message -match 'timed out|timeout|temporar|throttl|too many requests|connection.+(reset|aborted|closed)|remote party closed|EOF|unexpected end'
                 }
@@ -2799,7 +3068,7 @@ elseif ($PSCmdlet.ParameterSetName -eq 'ScanTenant') {
 
                     [PSCustomObject]@{ __Progress = $true; FrontDoorName = $fd.Name; EndpointCount = $endpointCount }
                 } catch {
-                    [PSCustomObject]@{ __Progress = $true; FrontDoorName = $fd.Name; EndpointCount = 0; Error = $_.Exception.Message }
+                    [PSCustomObject]@{ __Progress = $true; FrontDoorName = $fd.Name; EndpointCount = 0; Error = (Get-ExceptionMessageSummaryLocal -Exception $_.Exception) }
                 }
             } | ForEach-Object {
                 if ($_.PSObject.Properties['__Progress']) {
@@ -2831,6 +3100,35 @@ elseif ($PSCmdlet.ParameterSetName -eq 'ScanTenant') {
                     $scanAt = $using:scanStartedAt
                     $tlsRetryCount = $using:TlsRetryCount
                     $retryBaseDelayMs = $using:RetryBaseDelayMs
+
+                    function Get-ExceptionMessageSummaryLocal {
+                        param([AllowNull()][System.Exception]$Exception, [string]$PrefixMessage)
+
+                        $messageParts = [System.Collections.Generic.List[string]]::new()
+                        if (-not [string]::IsNullOrWhiteSpace($PrefixMessage)) {
+                            $messageParts.Add($PrefixMessage)
+                        }
+
+                        $currentException = $Exception
+                        while ($currentException) {
+                            $message = [string]$currentException.Message
+                            if (-not [string]::IsNullOrWhiteSpace($message) -and -not $messageParts.Contains($message)) {
+                                $messageParts.Add($message)
+                            }
+
+                            if (-not $currentException.InnerException -or $currentException.InnerException -eq $currentException) {
+                                break
+                            }
+
+                            $currentException = $currentException.InnerException
+                        }
+
+                        if ($messageParts.Count -eq 0) {
+                            return $null
+                        }
+
+                        return ($messageParts -join ' ')
+                    }
 
                     # Normalizes issuer metadata into consistent Issuer and IssuingCA values.
                     function Get-IssuerDetailsLocal {
@@ -2882,13 +3180,7 @@ elseif ($PSCmdlet.ParameterSetName -eq 'ScanTenant') {
                     function Test-IsTransientTlsFailureLocal {
                         param([AllowNull()][System.Exception]$Exception, [string]$FailureMessage)
 
-                        $message = $FailureMessage
-                        if ($Exception -and $Exception.Message) {
-                            $message = if ($message) { "{0} {1}" -f $message, $Exception.Message } else { $Exception.Message }
-                        }
-                        if ($Exception -and $Exception.InnerException -and $Exception.InnerException.Message) {
-                            $message = if ($message) { "{0} {1}" -f $message, $Exception.InnerException.Message } else { $Exception.InnerException.Message }
-                        }
+                        $message = Get-ExceptionMessageSummaryLocal -Exception $Exception -PrefixMessage $FailureMessage
 
                         return $message -match 'timed out|timeout|temporar|connection.+(reset|aborted|closed)|remote party closed|EOF|unexpected end|network.+unreachable|host.+unreachable|Proxy CONNECT failed: HTTP/\d\.\d (429|502|503|504)'
                     }
@@ -2970,6 +3262,41 @@ elseif ($PSCmdlet.ParameterSetName -eq 'ScanTenant') {
                         }
 
                         return ($statuses -join ',')
+                    }
+
+                    # Mirrors the exported ChainStatus format used by the non-parallel scan paths.
+                    function Get-CertificateStatusSummaryLocal {
+                        param([string]$ChainStatus, [string]$ExpirationStatus, [string[]]$Errors, [bool]$HasExpirationDate)
+
+                        $parts = [System.Collections.Generic.List[string]]::new()
+                        $uniqueErrors = @(
+                            $Errors |
+                                Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } |
+                                Select-Object -Unique
+                        )
+
+                        foreach ($error in $uniqueErrors) {
+                            $parts.Add("CheckError: $error")
+                        }
+
+                        if (-not [string]::IsNullOrWhiteSpace($ChainStatus) -and $ChainStatus -ne 'Valid') {
+                            $parts.Add("Chain: $ChainStatus")
+                        }
+
+                        switch ($ExpirationStatus) {
+                            'EXPIRED' { $parts.Add('Expiration: EXPIRED') }
+                            'WARNING' { $parts.Add('Expiration: WARNING') }
+                        }
+
+                        if ($parts.Count -gt 0) {
+                            return ($parts -join ' | ')
+                        }
+
+                        if ($ChainStatus -eq 'Valid' -or ($HasExpirationDate -and $ExpirationStatus -eq 'OK')) {
+                            return 'OK'
+                        }
+
+                        return 'NoData'
                     }
 
                     # Builds certificate-chain metadata from the live certificate presented by the endpoint.
@@ -3064,6 +3391,7 @@ elseif ($PSCmdlet.ParameterSetName -eq 'ScanTenant') {
                     $chainStatus = $null
                     $digiCertIssued = $null
                     $probeResult = $null
+                    $statusErrors = [System.Collections.Generic.List[string]]::new()
                     
                     # Inline the TLS probe so each runspace can own and dispose its own socket state.
                     try {
@@ -3154,6 +3482,8 @@ elseif ($PSCmdlet.ParameterSetName -eq 'ScanTenant') {
                             $digiCertIssued = $probeResult.DigiCertIssued
                         }
                     } catch {
+                        $errorMsg = Get-ExceptionMessageSummaryLocal -Exception $_.Exception
+                        $null = $statusErrors.Add("TLS: $errorMsg")
                     }
                     
                     # Calculate expiration status
@@ -3164,6 +3494,7 @@ elseif ($PSCmdlet.ParameterSetName -eq 'ScanTenant') {
                         $daysUntilExpiry = ($expiryDate - $scanAt).Days
                         $expiryStatus = if ($daysUntilExpiry -lt 0) { 'EXPIRED' } elseif ($daysUntilExpiry -le $warnDays) { 'WARNING' } else { 'OK' }
                     }
+                    $overallStatus = Get-CertificateStatusSummaryLocal -ChainStatus $chainStatus -ExpirationStatus $expiryStatus -Errors @($statusErrors) -HasExpirationDate ($null -ne $expiryDate)
                     
                     [PSCustomObject]@{
                         SubscriptionId     = $ep.SubscriptionId
@@ -3183,8 +3514,9 @@ elseif ($PSCmdlet.ParameterSetName -eq 'ScanTenant') {
                         ServerCertificateCount = $serverCertificateCount
                         IntermediateCA         = $intermediateCA
                         RootCA                 = $rootCA
-                        ChainStatus            = $chainStatus
+                        ChainStatus            = $overallStatus
                         DigiCertIssued         = $digiCertIssued
+                        ExpirationDateRaw  = $expiryDate
                         ExpirationDate     = $expiryDisplay
                         ExpirationStatus   = $expiryStatus
                         KeyVaultName       = $ep.KeyVaultName
@@ -3353,28 +3685,36 @@ if ($allResults.Count -eq 0) {
     if ($ExportCsvPath -or $ExportXlsxPath) {
         $exportColumns = Get-ResultExportColumns
         $exportRecords = @($allResults | Select-Object $exportColumns)
+        $xlsxExportRecords = Get-XlsxExportRecords -Results $allResults -Columns $exportColumns
 
         $resolvedExportCsvPath = $null
         if ($ExportCsvPath) {
-            $resolvedExportCsvPath = Ensure-ParentDirectoryExists -FilePath $ExportCsvPath
+            $resolvedExportCsvPath = Initialize-ParentDirectoryPath -FilePath $ExportCsvPath
             $exportRecords | Export-Csv -LiteralPath $resolvedExportCsvPath -NoTypeInformation -Encoding utf8 -Force
             Write-Host "`nResults exported to: $resolvedExportCsvPath" -ForegroundColor Green
         }
 
         # An explicit XLSX path wins; otherwise keep the existing companion-workbook behavior
         # by deriving the workbook path from the CSV export path.
+        $resolvedExportXlsxInfo = $null
         $resolvedExportXlsxPath = $null
         if ($ExportXlsxPath) {
-            $resolvedExportXlsxPath = Ensure-ParentDirectoryExists -FilePath $ExportXlsxPath
+            $resolvedExportXlsxInfo = Resolve-AvailableExportFilePath -FilePath $ExportXlsxPath
+            $resolvedExportXlsxPath = $resolvedExportXlsxInfo.Path
         }
         elseif ($resolvedExportCsvPath) {
-            $resolvedExportXlsxPath = [System.IO.Path]::ChangeExtension($resolvedExportCsvPath, '.xlsx')
+            $resolvedExportXlsxInfo = Resolve-AvailableExportFilePath -FilePath ([System.IO.Path]::ChangeExtension($resolvedExportCsvPath, '.xlsx'))
+            $resolvedExportXlsxPath = $resolvedExportXlsxInfo.Path
         }
 
         $importExcelModule = Get-Module -ListAvailable -Name ImportExcel | Sort-Object Version -Descending | Select-Object -First 1
         if ($resolvedExportXlsxPath -and $importExcelModule) {
             try {
                 Import-Module $importExcelModule.Path -ErrorAction Stop | Out-Null
+
+                if ($resolvedExportXlsxInfo -and $resolvedExportXlsxInfo.Redirected) {
+                    Write-Host "Requested XLSX path is in use. Exporting workbook to: $resolvedExportXlsxPath" -ForegroundColor DarkYellow
+                }
 
                 $xlsxTextColumns = @(
                     'SubscriptionId',
@@ -3394,7 +3734,6 @@ if ($allResults.Count -eq 0) {
                     'IntermediateCA',
                     'RootCA',
                     'ChainStatus',
-                    'ExpirationStatus',
                     'KeyVaultName',
                     'KeyVaultSecretName'
                 )
@@ -3408,9 +3747,32 @@ if ($allResults.Count -eq 0) {
                     $worksheetName = $worksheetName.Substring(0, 31)
                 }
 
+                $expirationDateColumnIndex = [Array]::IndexOf($exportColumns, 'ExpirationDate') + 1
+                $serverCertificateCountColumnIndex = [Array]::IndexOf($exportColumns, 'ServerCertificateCount') + 1
+                $chainStatusColumnIndex = [Array]::IndexOf($exportColumns, 'ChainStatus') + 1
+                $digiCertIssuedColumnIndex = [Array]::IndexOf($exportColumns, 'DigiCertIssued') + 1
+                $expirationDateNumberFormat = [System.Globalization.CultureInfo]::CurrentCulture.DateTimeFormat.FullDateTimePattern
+                $expirationDateNumberFormat = $expirationDateNumberFormat -replace '(?<!t)tt(?!t)', 'AM/PM'
+                $expirationDateNumberFormat = $expirationDateNumberFormat -replace '(?<!t)t(?!t)', 'A/P'
+                $xlsxCellStyle = {
+                    param($worksheet, $totalRows, $lastColumn)
+
+                    $centeredColumns = @($serverCertificateCountColumnIndex, $chainStatusColumnIndex, $digiCertIssuedColumnIndex)
+                    foreach ($columnIndex in $centeredColumns) {
+                        if ($columnIndex -gt 0) {
+                            $worksheet.Column($columnIndex).Style.HorizontalAlignment = [OfficeOpenXml.Style.ExcelHorizontalAlignment]::Center
+                        }
+                    }
+
+                    if ($expirationDateColumnIndex -gt 0) {
+                        $worksheet.Column($expirationDateColumnIndex).Style.Numberformat.Format = $expirationDateNumberFormat
+                        $worksheet.Column($expirationDateColumnIndex).Style.HorizontalAlignment = [OfficeOpenXml.Style.ExcelHorizontalAlignment]::Center
+                    }
+                }.GetNewClosure()
+
                 # ImportExcel attempts CurrentCulture numeric parsing on string values by default.
                 # Keep text-heavy columns as literal text so hostnames and IDs are never coerced.
-                $exportRecords | Export-Excel -Path $resolvedExportXlsxPath -WorksheetName $worksheetName -TableName Table1 -TableStyle Medium2 -NoNumberConversion $xlsxTextColumns -AutoFilter -AutoSize -FreezeTopRow -ClearSheet | Out-Null
+                $xlsxExportRecords | Export-Excel -Path $resolvedExportXlsxPath -WorksheetName $worksheetName -TableName Table1 -TableStyle Medium2 -NoNumberConversion $xlsxTextColumns -AutoFilter -AutoSize -FreezeTopRow -ClearSheet -CellStyleSB $xlsxCellStyle | Out-Null
                 Set-XlsxTableStyleInfo -Path $resolvedExportXlsxPath -TableStyleName 'TableStyleMedium2'
                 if ($resolvedExportCsvPath) {
                     Write-Host "Companion XLSX exported to: $resolvedExportXlsxPath" -ForegroundColor Green
