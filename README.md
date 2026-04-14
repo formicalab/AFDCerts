@@ -23,7 +23,7 @@ Tenant-wide discovery uses Azure Resource Graph and ARM through REST with the be
 - Applies retry and backoff for transient REST and TLS failures
 - Exports to CSV and, when ImportExcel is available, to XLSX with the same table styling used by Get-AFDOriginCertChains, or shows results in GridView
 
-`-GridView` cannot be combined with `-ExportCsvPath` or `-ExportXlsxPath`. The two export paths can be used together.
+`-GridView` cannot be combined with `-ExportCsvPath` or `-ExportXlsxPath`. The two export paths can be used together. GridView also requires a graphical session and is not supported in headless environments.
 
 ## Scan modes
 

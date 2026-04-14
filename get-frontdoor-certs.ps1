@@ -98,11 +98,13 @@
 .OUTPUTS
     System.Object[]
     The script outputs a formatted table showing certificate details and returns an array of
-    custom objects containing certificate information, including issuer, issuing CA, and
-    certificate-chain details. If ExportCsvPath is specified, results are also exported to a
-    CSV file using a stable column set that includes migration source/target resource IDs.
-    If ExportXlsxPath is specified, or when ImportExcel is installed and XLSX output is derived
-    from ExportCsvPath, a workbook is written with the same data.
+    custom objects containing certificate information, including migration source/target IDs,
+    endpoint associations, issuer metadata, Key Vault details, and certificate status data.
+    The exported ChainStatus field summarizes the overall certificate state for reporting by
+    combining live probe errors, chain validation results, and expiration warnings. If
+    ExportCsvPath is specified, results are also exported to a CSV file using a stable column
+    set. If ExportXlsxPath is specified, or when ImportExcel is installed and XLSX output is
+    derived from ExportCsvPath, a workbook is written with the same data.
 
 .EXAMPLE
     .\get-frontdoor-certs.ps1 -ScanFrontDoor "my-frontdoor-profile" -ResourceGroupName "my-resource-group"
@@ -178,6 +180,8 @@
     - Az.Accounts module is required for all modes
     - Az.FrontDoor module is required for Classic single-profile scans
     - ImportExcel module is optional for XLSX export
+        - Tenant-wide discovery uses Resource Graph and ARM via REST and does not require the
+            Az.ResourceGraph cmdlets
     
     Performance:
     - Tenant mode uses parallel processing for faster scanning
@@ -185,17 +189,17 @@
     - TlsThrottleLimit controls parallelism for TLS certificate probing (Classic FDs)
     - RestRetryCount and TlsRetryCount apply exponential backoff for transient failures
     - Progress updates are batched to reduce console I/O overhead
-        - Default Azure Front Door hostnames (*.azurefd.net) are skipped automatically
-            to focus on actionable customer-facing certificates
+        - Default Azure Front Door hostnames (*.azurefd.net) are skipped automatically to focus
+            on actionable customer-facing certificates
 
 .LINK
     https://github.com/formicalab/AFDCerts
 
 .LINK
-    https://docs.microsoft.com/en-us/azure/frontdoor/
+    https://learn.microsoft.com/azure/frontdoor/
 
 .LINK
-    https://docs.microsoft.com/en-us/powershell/azure/
+    https://learn.microsoft.com/powershell/azure/
 #>
 
 #Requires -PSEdition Core
@@ -854,22 +858,22 @@ function Get-CertificateStatusSummary {
         [string]$ExpirationStatus,
 
         [Parameter(Mandatory = $false)]
-        [string[]]$Errors,
+        [string[]]$StatusItems,
 
         [Parameter(Mandatory = $false)]
         [bool]$HasExpirationDate
     )
 
     $parts = [System.Collections.Generic.List[string]]::new()
-    $uniqueErrors = @(
-        $Errors |
+    $uniqueStatusItems = @(
+        $StatusItems |
             Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } |
             Select-Object -Unique
     )
 
-    foreach ($error in $uniqueErrors) {
-        $parts.Add("CheckError: $error")
-    }
+    $uniqueStatusItems | ForEach-Object {
+            $parts.Add("CheckError: $_")
+        }
 
     if (-not [string]::IsNullOrWhiteSpace($ChainStatus) -and $ChainStatus -ne 'Valid') {
         $parts.Add("Chain: $ChainStatus")
@@ -1836,7 +1840,7 @@ function Get-FrontDoorCertificates {
                 $expiryDisplay = $expiryInfo.Display
                 $expiryStatus = $expiryInfo.Status
                 $expiryRaw = $expiryInfo.Value
-                $overallStatus = Get-CertificateStatusSummary -ChainStatus $chainStatus -ExpirationStatus $expiryStatus -Errors @($statusErrors) -HasExpirationDate ($null -ne $expiryRaw)
+                $overallStatus = Get-CertificateStatusSummary -ChainStatus $chainStatus -ExpirationStatus $expiryStatus -StatusItems @($statusErrors) -HasExpirationDate ($null -ne $expiryRaw)
                 
                 $result = [PSCustomObject]@{
                     SubscriptionId     = $context.Subscription.Id
@@ -2048,7 +2052,7 @@ function Get-FrontDoorCertificates {
                 $expiryDisplay = $expiryInfo.Display
                 $expiryStatus = $expiryInfo.Status
                 $expiryRaw = $expiryInfo.Value
-                $overallStatus = Get-CertificateStatusSummary -ChainStatus $chainStatus -ExpirationStatus $expiryStatus -Errors @($statusErrors) -HasExpirationDate ($null -ne $expiryRaw)
+                $overallStatus = Get-CertificateStatusSummary -ChainStatus $chainStatus -ExpirationStatus $expiryStatus -StatusItems @($statusErrors) -HasExpirationDate ($null -ne $expiryRaw)
 
                 $result = [PSCustomObject]@{
                     SubscriptionId     = $context.Subscription.Id
@@ -2509,18 +2513,18 @@ elseif ($PSCmdlet.ParameterSetName -eq 'ScanTenant') {
 
                 # Mirrors the exported ChainStatus format used by the non-parallel scan paths.
                 function Get-CertificateStatusSummaryLocal {
-                    param([string]$ChainStatus, [string]$ExpirationStatus, [string[]]$Errors, [bool]$HasExpirationDate)
+                    param([string]$ChainStatus, [string]$ExpirationStatus, [string[]]$StatusItems, [bool]$HasExpirationDate)
 
                     $parts = [System.Collections.Generic.List[string]]::new()
-                    $uniqueErrors = @(
-                        $Errors |
+                    $uniqueStatusItems = @(
+                        $StatusItems |
                             Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } |
                             Select-Object -Unique
                     )
 
-                    foreach ($error in $uniqueErrors) {
-                        $parts.Add("CheckError: $error")
-                    }
+                    $uniqueStatusItems | ForEach-Object {
+                            $parts.Add("CheckError: $_")
+                        }
 
                     if (-not [string]::IsNullOrWhiteSpace($ChainStatus) -and $ChainStatus -ne 'Valid') {
                         $parts.Add("Chain: $ChainStatus")
@@ -2826,7 +2830,7 @@ elseif ($PSCmdlet.ParameterSetName -eq 'ScanTenant') {
                                 $expiryStatus = if ($daysUntilExpiry -lt 0) { 'EXPIRED' } elseif ($daysUntilExpiry -le $warnDays) { 'WARNING' } else { 'OK' }
                             } catch { $expiryDisplay = $expiryDate }
                         }
-                        $overallStatus = Get-CertificateStatusSummaryLocal -ChainStatus $chainStatus -ExpirationStatus $expiryStatus -Errors @($statusErrors) -HasExpirationDate ($null -ne $expiryDateTime)
+                        $overallStatus = Get-CertificateStatusSummaryLocal -ChainStatus $chainStatus -ExpirationStatus $expiryStatus -StatusItems @($statusErrors) -HasExpirationDate ($null -ne $expiryDateTime)
                         
                         [PSCustomObject]@{
                             SubscriptionId     = $fd.SubscriptionId
@@ -3266,18 +3270,18 @@ elseif ($PSCmdlet.ParameterSetName -eq 'ScanTenant') {
 
                     # Mirrors the exported ChainStatus format used by the non-parallel scan paths.
                     function Get-CertificateStatusSummaryLocal {
-                        param([string]$ChainStatus, [string]$ExpirationStatus, [string[]]$Errors, [bool]$HasExpirationDate)
+                        param([string]$ChainStatus, [string]$ExpirationStatus, [string[]]$StatusItems, [bool]$HasExpirationDate)
 
                         $parts = [System.Collections.Generic.List[string]]::new()
-                        $uniqueErrors = @(
-                            $Errors |
+                        $uniqueStatusItems = @(
+                            $StatusItems |
                                 Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } |
                                 Select-Object -Unique
                         )
 
-                        foreach ($error in $uniqueErrors) {
-                            $parts.Add("CheckError: $error")
-                        }
+                        $uniqueStatusItems | ForEach-Object {
+                                $parts.Add("CheckError: $_")
+                            }
 
                         if (-not [string]::IsNullOrWhiteSpace($ChainStatus) -and $ChainStatus -ne 'Valid') {
                             $parts.Add("Chain: $ChainStatus")
@@ -3494,7 +3498,7 @@ elseif ($PSCmdlet.ParameterSetName -eq 'ScanTenant') {
                         $daysUntilExpiry = ($expiryDate - $scanAt).Days
                         $expiryStatus = if ($daysUntilExpiry -lt 0) { 'EXPIRED' } elseif ($daysUntilExpiry -le $warnDays) { 'WARNING' } else { 'OK' }
                     }
-                    $overallStatus = Get-CertificateStatusSummaryLocal -ChainStatus $chainStatus -ExpirationStatus $expiryStatus -Errors @($statusErrors) -HasExpirationDate ($null -ne $expiryDate)
+                    $overallStatus = Get-CertificateStatusSummaryLocal -ChainStatus $chainStatus -ExpirationStatus $expiryStatus -StatusItems @($statusErrors) -HasExpirationDate ($null -ne $expiryDate)
                     
                     [PSCustomObject]@{
                         SubscriptionId     = $ep.SubscriptionId
