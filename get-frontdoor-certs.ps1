@@ -1492,9 +1492,10 @@ function Get-FormattedExpirationDate {
         $expiryDateTime = $expiryDate -is [DateTime] ? $expiryDate : [DateTime]::Parse($expiryDate)
         
         $formattedDate = $expiryDateTime.ToString()
-        $daysUntilExpiry = ($expiryDateTime - (Get-Date)).Days
+        $scanAt = Get-Date
+        $daysUntilExpiry = ($expiryDateTime - $scanAt).Days
         
-        $status = $daysUntilExpiry -lt 0 ? 'EXPIRED' : ($daysUntilExpiry -le $warningDays ? 'WARNING' : 'OK')
+        $status = $expiryDateTime -lt $scanAt ? 'EXPIRED' : ($daysUntilExpiry -le $warningDays ? 'WARNING' : 'OK')
         
         return @{ Display = $formattedDate; Status = $status; Value = $expiryDateTime }
     } catch {
@@ -2827,7 +2828,7 @@ elseif ($PSCmdlet.ParameterSetName -eq 'ScanTenant') {
                                 $expiryDateTime = if ($expiryDate -is [DateTime]) { $expiryDate } else { [DateTime]::Parse($expiryDate) }
                                 $expiryDisplay = $expiryDateTime.ToString()
                                 $daysUntilExpiry = ($expiryDateTime - $scanAt).Days
-                                $expiryStatus = if ($daysUntilExpiry -lt 0) { 'EXPIRED' } elseif ($daysUntilExpiry -le $warnDays) { 'WARNING' } else { 'OK' }
+                                $expiryStatus = if ($expiryDateTime -lt $scanAt) { 'EXPIRED' } elseif ($daysUntilExpiry -le $warnDays) { 'WARNING' } else { 'OK' }
                             } catch { $expiryDisplay = $expiryDate }
                         }
                         $overallStatus = Get-CertificateStatusSummaryLocal -ChainStatus $chainStatus -ExpirationStatus $expiryStatus -StatusItems @($statusErrors) -HasExpirationDate ($null -ne $expiryDateTime)
@@ -3496,7 +3497,7 @@ elseif ($PSCmdlet.ParameterSetName -eq 'ScanTenant') {
                     if ($expiryDate) {
                         $expiryDisplay = $expiryDate.ToString()
                         $daysUntilExpiry = ($expiryDate - $scanAt).Days
-                        $expiryStatus = if ($daysUntilExpiry -lt 0) { 'EXPIRED' } elseif ($daysUntilExpiry -le $warnDays) { 'WARNING' } else { 'OK' }
+                        $expiryStatus = if ($expiryDate -lt $scanAt) { 'EXPIRED' } elseif ($daysUntilExpiry -le $warnDays) { 'WARNING' } else { 'OK' }
                     }
                     $overallStatus = Get-CertificateStatusSummaryLocal -ChainStatus $chainStatus -ExpirationStatus $expiryStatus -StatusItems @($statusErrors) -HasExpirationDate ($null -ne $expiryDate)
                     
