@@ -126,10 +126,15 @@ param(
 Set-StrictMode -Version 1
 $ErrorActionPreference = 'Stop'
 
+# ARM REST API versions. 2025-04-15 targets the Microsoft.Cdn (Standard/Premium AFD)
+# surface; 2021-06-01 is the last stable version for Microsoft.Network/frontDoors (Classic).
 $script:ApiVersion = '2025-04-15'
 $script:ClassicApiVersion = '2021-06-01'
 
-# Resolve process-wide proxy once; use IsBypassed for a robust "no proxy" check.
+# Resolve the effective system proxy once at startup. IsBypassed filters out the
+# .NET fallback where GetSystemWebProxy() returns a proxy whose rule set would
+# bypass the target URI anyway. If a real proxy is in use, Classic TLS probes
+# must open an HTTP CONNECT tunnel since raw TCP will not traverse a proxy.
 $script:ProxyUri = $null
 $proxyTestUri = [Uri]"https://management.azure.com"
 $systemProxy = [System.Net.WebRequest]::GetSystemWebProxy()
@@ -148,8 +153,15 @@ if ($script:ProxyUri) {
 
 #region Shared helpers (usable in main scope and runspaces via dot-source)
 
-# Keep helper bodies in a single here-string so ForEach-Object -Parallel runspaces
-# can dot-source them without duplicating ~700 lines.
+# PowerShell 7 parallel runspaces do not inherit caller-scope functions. Rather
+# than copying ~700 lines of helper code into each runspace scriptblock, every
+# helper lives in this single here-string. Both the main scope below and each
+# parallel worker dot-source the same string via:
+#     . ([ScriptBlock]::Create($helperSource))
+# Helpers: exception parsing, transient-failure classification, exponential
+# retry, TLS probing (with optional HTTP CONNECT), certificate chain walking,
+# and expiry/status formatting. The main scope also overrides Invoke-WithRetry
+# below with a variant that accepts an -OperationName for verbose logging.
 $script:HelperSource = @'
 function Get-HttpStatusCodeFromException {
     param([AllowNull()][System.Exception]$Exception)
@@ -413,7 +425,8 @@ function Get-FormattedExpirationDate {
 }
 '@
 
-# Dot-source helpers into main scope.
+# Load helper bodies into the main script scope. The same here-string is later
+# passed to each parallel runspace via $using:HelperSource.
 . ([ScriptBlock]::Create($script:HelperSource))
 
 #endregion
@@ -500,8 +513,10 @@ function Get-ProgressInterval {
     return [Math]::Max([int][Math]::Ceiling($TotalCount / 20.0), 1)
 }
 
-# Invoke-WithRetry at script scope needs OperationName but runspace copy (from HelperSource) does not.
-# Override main-scope version here with full signature.
+# Main-scope override of Invoke-WithRetry. Identical retry/backoff logic as the
+# runspace copy but adds -OperationName for Write-Verbose diagnostics (which
+# cannot flow cleanly out of a parallel runspace, hence the simpler signature
+# there).
 function Invoke-WithRetry {
     param(
         [Parameter(Mandatory)][scriptblock]$Action,
@@ -531,6 +546,13 @@ function Invoke-WithRetry {
 
 #region Resource Graph queries
 
+# Single Kusto query covers all three execution modes (single FD, subscription,
+# tenant). microsoft.cdn/profiles rows represent Standard/Premium AFDs;
+# microsoft.network/frontdoors rows represent Classic AFDs. The
+# extendedProperties object carries migration linkage: MigratedFrom on the
+# Standard/Premium side points back to the Classic source; MigratedTo on the
+# Classic side points to the Standard/Premium target. skuName filtering avoids
+# pulling CDN profiles that are not Azure Front Door.
 $script:FrontDoorGraphQuery = @'
 resources
 | where type in~ ('microsoft.cdn/profiles', 'microsoft.network/frontdoors')
@@ -798,8 +820,11 @@ function ConvertTo-ClassicEndpointRecord {
 
 #region Per-domain processing (shared logic)
 
-# Build a result record for a Standard/Premium domain given the custom-domain object,
-# its association lookup, the Front Door context, and helpers for REST/TLS.
+# Build a result record for a single Standard/Premium custom domain. Combines
+# ARM metadata (provisioning/validation state, managed vs customer certificate,
+# Key Vault reference) with a live TLS probe to enrich chain details and pick
+# up issuer info when ARM does not expose it. The $WriteProgress flag lets the
+# sequential callers print per-domain progress while parallel callers stay quiet.
 function New-StdPremDomainResult {
     param(
         [Parameter(Mandatory)]$Domain,
@@ -918,6 +943,9 @@ function New-StdPremDomainResult {
     }
 }
 
+# Build a result record for a single Classic frontend endpoint. Classic AFD
+# does not expose certificate chain details through ARM, so all enrichment
+# (subject, issuer, chain, expiry) comes from the live TLS probe.
 function New-ClassicEndpointResult {
     param(
         [Parameter(Mandatory)][PSCustomObject]$EndpointRecord,
@@ -1015,6 +1043,9 @@ function Get-StandardPremiumFrontDoorCertificates {
         return $results
     }
     Write-Host "  Found $($eligible.Count) custom domain(s). Processing..."
+    # Walk endpoints + routes to map each custom domain -> list of endpoint
+    # hostnames so the EndpointAssociation column is populated. Failure here is
+    # non-fatal: domains just show as 'Unassociated'.
     $assocMap = @{}
     try {
         $assocMap = Get-StdPremEndpointAssociations -Headers $Headers -SubscriptionId $subId -ResourceGroupName $rgName -ProfileName $fdName
@@ -1022,10 +1053,6 @@ function Get-StandardPremiumFrontDoorCertificates {
         $err = Get-ExceptionMessageSummary -Exception $_.Exception
         Write-Host "  Failed to resolve endpoint associations for ${fdName}: $err" -ForegroundColor Yellow
     }
-
-    $restInvoker = $null
-    $tlsInvoker = $null
-    $log = $null
 
     foreach ($d in $eligible) {
         $r = New-StdPremDomainResult -Domain $d -AssociationMap $assocMap -Headers $Headers `
@@ -1099,7 +1126,8 @@ function Get-FrontDoorCertificatesByInfo {
 
 #region Main execution
 
-# Verify Azure login
+# Guardrails: require an interactive Az session and reject nonsensical flag
+# combinations before spending any time on discovery.
 $context = Get-AzContext
 if (-not $context) { throw "Not logged in to Azure. Please run Connect-AzAccount first." }
 if ($GridView -and ($ExportCsvPath -or $ExportXlsxPath)) {
@@ -1111,7 +1139,10 @@ $allResults = [System.Collections.Generic.List[PSCustomObject]]::new()
 Write-Host "`n=== Azure Front Door Certificate Checker ===" -ForegroundColor Cyan
 Write-Host "Execution Mode: $($PSCmdlet.ParameterSetName)`n" -ForegroundColor Cyan
 
-# Acquire bearer token up front; all modes use ARM REST now (drops Az.FrontDoor).
+# Acquire an ARM bearer token up front. All three modes talk to ARM via REST
+# (including Classic discovery), so Az.FrontDoor is not required. The token
+# payload is also decoded to log who is running the scan and against which
+# tenant, which is useful for multi-tenant operators.
 Write-Host "Acquiring Azure bearer token..." -ForegroundColor Cyan
 $tokenInfo = Get-ArmBearerToken
 $script:Headers = @{ Authorization = "Bearer $($tokenInfo.Token)"; 'Content-Type' = 'application/json' }
@@ -1146,6 +1177,9 @@ if ($PSCmdlet.ParameterSetName -eq 'SingleFrontDoor') {
     }
 }
 elseif ($PSCmdlet.ParameterSetName -eq 'ScanSubscription') {
+    # An explicit -ScanSubscription forces a context switch and a token refresh:
+    # the old token may be scoped to a different tenant, so re-acquire to match
+    # the new context. Empty string keeps the current context.
     if ($ScanSubscription) {
         Write-Host "Switching to subscription: $ScanSubscription..." -ForegroundColor Cyan
         try { $null = Set-AzContext -Subscription $ScanSubscription -ErrorAction Stop }
@@ -1176,6 +1210,11 @@ elseif ($PSCmdlet.ParameterSetName -eq 'ScanSubscription') {
     }
 }
 elseif ($PSCmdlet.ParameterSetName -eq 'ScanTenant') {
+    # Tenant mode runs two parallel pipelines (Standard/Premium and Classic).
+    # Both pipelines use the sentinel-object trick: worker runspaces can emit
+    # either a real result record or a [PSCustomObject]@{ __Progress = $true; ... }
+    # marker, and the downstream ForEach-Object filters them apart. This keeps
+    # progress updates on the main thread while results stream into $allResults.
     Write-Host "Scanning all Front Door profiles across tenant using Resource Graph..." -ForegroundColor Cyan
     Write-Host "  Parallelism: ThrottleLimit=$ThrottleLimit, TlsThrottleLimit=$TlsThrottleLimit" -ForegroundColor Gray
     Write-Host "`n[1/3] Resolving enabled subscriptions..." -ForegroundColor Cyan
@@ -1204,6 +1243,11 @@ elseif ($PSCmdlet.ParameterSetName -eq 'ScanTenant') {
             $progressInterval = Get-ProgressInterval -TotalCount $stdFDs.Count
             $processedCount = 0
 
+            # Each runspace processes one Front Door end-to-end: enumerate custom
+            # domains, enumerate endpoints+routes for association mapping, fetch
+            # each domain's certificate secret, and then perform a live TLS probe.
+            # Inlined instead of delegating to New-StdPremDomainResult because
+            # runspaces cannot call main-scope functions.
             $stdFDs | ForEach-Object -ThrottleLimit $ThrottleLimit -Parallel {
                 $fd = $_
                 $hdrs = $using:Headers
@@ -1383,6 +1427,11 @@ elseif ($PSCmdlet.ParameterSetName -eq 'ScanTenant') {
         }
 
         if ($clsFDs.Count -gt 0) {
+            # Classic mode is split into two stages:
+            #   Stage 1: enumerate frontendEndpoints from each Classic AFD (ARM-bound).
+            #   Stage 2: TLS-probe each eligible endpoint to collect certificate data.
+            # Stage 2 uses a higher throttle limit (-TlsThrottleLimit) because
+            # it is network-bound rather than ARM-bound.
             Write-Host "  Processing $($clsFDs.Count) Classic Front Door(s)..." -ForegroundColor Cyan
             $clsEndpoints = [System.Collections.Generic.List[PSCustomObject]]::new()
             $clsProgressInterval = Get-ProgressInterval -TotalCount $clsFDs.Count
@@ -1542,7 +1591,16 @@ function Get-TruncatedString {
     return $Text.Substring(0, $MaxLength - 3) + "..."
 }
 
-# Column descriptors consolidate column widths, property getters, and per-row coloring.
+# Each column descriptor bundles everything the renderer needs for one column:
+#   Key       - stable identifier used to look up computed widths
+#   Header    - label printed in the header row
+#   Prop      - source property name on the result record (simple passthrough)
+#   Value     - scriptblock for computed columns (overrides Prop)
+#   Min/Ideal - minimum and preferred width in characters
+#   IconPrefix- scriptblock returning a prefix string (icon) for a given row
+#   Color     - scriptblock returning the Write-Host foreground color for a row
+# Resolve-DisplayColumnWidths below distributes the available console width
+# across the descriptors proportional to (Ideal - Min).
 function Get-DisplayColumnDescriptors {
     param([bool]$HasValidationState)
     $descriptors = @(
@@ -1599,12 +1657,17 @@ function Get-DisplayColumnDescriptors {
     return $descriptors
 }
 
+# Compute the final per-column character width. If the console is wide enough
+# to honour every column's Min, distribute the leftover space proportional to
+# each column's (Ideal - Min) appetite, capped at Ideal. Otherwise, fall back
+# to every column at its Min and let the caller truncate.
 function Resolve-DisplayColumnWidths {
     param([Parameter(Mandatory)][array]$Descriptors, [int]$MinWidth = 80)
     try {
         $consoleWidth = $Host.UI.RawUI.WindowSize.Width
         if ($consoleWidth -lt $MinWidth) { $consoleWidth = $MinWidth }
     } catch { $consoleWidth = 160 }
+    # Reserve a small right margin so the last column never wraps.
     $available = $consoleWidth - 10
     $minSum = ($Descriptors | ForEach-Object { $_.Min + 1 } | Measure-Object -Sum).Sum
     $widths = @{}
@@ -1696,6 +1759,10 @@ if ($allResults.Count -eq 0) {
     if ($warning -gt 0) { Write-Host "⚠️  $warning certificate(s) expiring within $WarningDays days" -ForegroundColor Yellow }
     if ($expired -eq 0 -and $warning -eq 0) { Write-Host "✅ All certificates are valid and not expiring soon" -ForegroundColor Green }
 
+    # Export path: CSV always projects the stable column list via Select-Object
+    # (so internal helper properties like ExpirationDateRaw / ExpirationStatus
+    # are excluded). XLSX uses Get-XlsxExportRecords to promote the raw DateTime
+    # back into ExpirationDate so Excel can format it as a real date column.
     if ($ExportCsvPath -or $ExportXlsxPath) {
         $cols = Get-ResultExportColumns
         $records = @($allResults | Select-Object $cols)
@@ -1718,6 +1785,12 @@ if ($allResults.Count -eq 0) {
             $resolvedXlsx = $resolvedXlsxInfo.Path
         }
 
+        # XLSX is optional and depends on the ImportExcel module being present.
+        # When installed, Export-Excel creates a formatted workbook (auto-filter,
+        # frozen header, centred numeric columns, typed date column). A final
+        # ZIP patch step (Set-XlsxTableStyleInfo) normalizes the Table1 style
+        # definition so the generated workbook matches the Medium2 preset even
+        # when ImportExcel writes a variant.
         $importExcel = Get-Module -ListAvailable -Name ImportExcel | Sort-Object Version -Descending | Select-Object -First 1
         if ($resolvedXlsx -and $importExcel) {
             try {
